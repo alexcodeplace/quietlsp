@@ -20,6 +20,10 @@ REALDIR="$SANDBOX/realbin"
 mkdir -p "$REALDIR"
 cat >"$REALDIR/typescript-language-server" <<'EOF'
 #!/usr/bin/env bash
+# Mimics a real LSP server enough for the launch probe: --version exits
+# immediately (as typescript-language-server/rust-analyzer do); anything
+# else behaves as a stdio pipe-through for the filter-level fixtures.
+if [ "${1:-}" = "--version" ]; then echo "fake-1.0.0"; exit 0; fi
 exec cat
 EOF
 chmod 755 "$REALDIR/typescript-language-server"
@@ -27,6 +31,7 @@ chmod 755 "$REALDIR/typescript-language-server"
 # binary found" branch without a fatal exit.
 
 export QUIETLSP_PLUGIN_CACHE="$CACHE"
+export QUIETLSP_STATE_DIR="$SANDBOX/state"
 export PATH="$REALDIR:/usr/bin:/bin"
 INSTALLER="$REPO/install-quietlsp"
 
@@ -84,6 +89,43 @@ out="$(run --status 2>&1)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -q 'UNWRAPPED' \
   && ok "--status reports UNWRAPPED after uninstall" \
   || { not_ok "--status reports UNWRAPPED after uninstall"; echo "$out"; }
+
+# 8. Pre-validate ALL targets before any write (R8): a collision in a LATER
+#    version dir must refuse the WHOLE run, leaving an EARLIER, otherwise-
+#    installable version dir untouched (no bin/ created at all).
+mkdir -p "$CACHE/typescript-lsp/1.0.2/bin"
+echo 'not a shim' > "$CACHE/typescript-lsp/1.0.2/bin/typescript-language-server"
+out="$(run 2>&1)"; rc=$?
+[ $rc -ne 0 ] && [ ! -e "$CACHE/typescript-lsp/1.0.0/bin" ] \
+  && ok "install validates every target before writing any (collision refuses whole run)" \
+  || { not_ok "install validates every target before writing any (collision refuses whole run)"; echo "$out"; }
+rm -rf -- "$CACHE/typescript-lsp/1.0.2"
+
+# 9. Nested wrapper refusal: a "real" binary that is itself a quietlsp shim
+#    (found via PATH, outside our own cache dirs) must refuse loudly, not
+#    wrap a wrapper.
+NESTED_DIR="$SANDBOX/nested-real"
+mkdir -p "$NESTED_DIR"
+{
+  echo '#!/usr/bin/env bash'
+  echo '# quietlsp-guard v1 — DO NOT EDIT. Reinstall with install-quietlsp.'
+  echo 'exec cat'
+} > "$NESTED_DIR/typescript-language-server"
+chmod 755 "$NESTED_DIR/typescript-language-server"
+out="$(PATH="$NESTED_DIR:/usr/bin:/bin" run 2>&1)"; rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q 'nested wrapper' \
+  && ok "install refuses to wrap a real binary that is itself a quietlsp shim" \
+  || { not_ok "install refuses to wrap a real binary that is itself a quietlsp shim"; echo "$out"; }
+rm -rf -- "$NESTED_DIR"
+
+# 10. --uninstall removes only recorded installs and leaves no stale records.
+run >/dev/null 2>&1
+record_count_before="$(find "$QUIETLSP_STATE_DIR/installs" -name '*.json' 2>/dev/null | wc -l)"
+run --uninstall >/dev/null 2>&1
+record_count_after="$(find "$QUIETLSP_STATE_DIR/installs" -name '*.json' 2>/dev/null | wc -l)"
+[ "$record_count_before" -gt 0 ] && [ "$record_count_after" -eq 0 ] \
+  && ok "--uninstall clears every recorded install, proving scoped restore" \
+  || { not_ok "--uninstall clears every recorded install, proving scoped restore"; echo "before=$record_count_before after=$record_count_after"; }
 
 if [ "$fail" -eq 0 ]; then
   echo "install-quietlsp tests: all passed"
