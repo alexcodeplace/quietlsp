@@ -111,17 +111,30 @@ function main() {
   const stdinWriter = makeOrderedWriter(child.stdin);
   const stdoutWriter = makeOrderedWriter(process.stdout);
 
+  // R3/R5: cwd is the one root captured at startup; workspaceFolders from
+  // the client's initialize (validated dirs only) are appended to this same
+  // array once seen. Diagnostics never arrive before initialize completes
+  // (protocol-ordered), and both sides run synchronously per chunk with no
+  // awaits in between, so makeFilter always sees roots as of the latest
+  // initialize by the time any publishDiagnostics is classified.
+  const allowedRoots = [scopeRoot];
+
   // client -> server: framed so the initialize capability rewrite (R1) can
   // touch exactly one frame; every other frame is forwarded as original
   // bytes, never JSON round-tripped.
-  const clientFilter = makeClientFilter(stdinWriter);
+  const clientFilter = makeClientFilter(stdinWriter, (msg) => {
+    const evidence = extractRootEvidence(msg, scopeRoot);
+    if (!evidence) return;
+    if (evidence.extraRoots.length) allowedRoots.push(...evidence.extraRoots);
+    if (evidence.disagreement) logOnce(evidence.disagreement);
+  });
   process.stdin.on('data', (chunk) => clientFilter.push(chunk));
   process.stdin.on('end', () => {
     clientFilter.flush();
     child.stdin.end(); // client EOF -> close child stdin (R11)
   });
 
-  const filter = makeFilter(scopeRoot, stdoutWriter);
+  const filter = makeFilter(allowedRoots, stdoutWriter);
   child.stdout.on('data', (chunk) => filter.push(chunk));
   // A well-formed LSP stream never ends mid-frame, but if the child exits
   // abruptly (crash/kill) any incomplete trailing bytes must still reach the
@@ -221,10 +234,13 @@ function rewriteInitializeCapabilities(msg, onRewrite) {
 // client -> server: passthrough for every frame except `initialize`, whose
 // body is JSON-parsed, has textDocument.diagnostic stripped, and is
 // re-emitted with Content-Length recomputed for that frame only.
-function makeClientFilter(stdinWriter) {
+// `onInitialize(msg)` fires at most once, the first time an `initialize`
+// request is seen, before it is (possibly) rewritten and forwarded.
+function makeClientFilter(stdinWriter, onInitialize) {
   let buf = Buffer.alloc(0);
   let failedOpen = false;
   let capabilityRewriteLogged = false;
+  let initializeSeen = false;
 
   function push(chunk) {
     if (failedOpen) {
@@ -256,6 +272,10 @@ function makeClientFilter(stdinWriter) {
       let outFrame = parsed.frame;
       try {
         const msg = JSON.parse(parsed.body.toString('utf8'));
+        if (msg.method === 'initialize' && !initializeSeen) {
+          initializeSeen = true;
+          if (onInitialize) onInitialize(msg);
+        }
         const rewrittenBody = rewriteInitializeCapabilities(msg, (original, rewritten) => {
           if (capabilityRewriteLogged) return;
           capabilityRewriteLogged = true;
@@ -342,6 +362,65 @@ function classifyFileUri(uri, roots) {
   return !roots.some((root) => isWithinRoot(root, real));
 }
 
+// R3/R5: reads the client's `initialize` for root evidence. Root itself is
+// captured ONCE at startup from cwd (session identity) and never changed by
+// this — a `rootUri` disagreement is only ever LOGGED (evidence, not
+// assumption), cwd still wins. `workspaceFolders` entries that validate
+// (file: scheme, exist, are a directory) become ADDITIONAL allowed roots for
+// legitimate out-of-cwd documents (project references, generated sources).
+function extractRootEvidence(msg, scopeRoot) {
+  if (!msg || msg.method !== 'initialize') return null;
+  const params = msg.params || {};
+
+  const extraRoots = [];
+  if (Array.isArray(params.workspaceFolders)) {
+    for (const folder of params.workspaceFolders) {
+      const uri = folder && folder.uri;
+      if (typeof uri !== 'string') continue;
+      let url;
+      try {
+        url = new URL(uri);
+      } catch {
+        continue;
+      }
+      if (url.protocol !== 'file:') continue;
+      let p;
+      try {
+        p = fileURLToPath(url);
+      } catch {
+        continue;
+      }
+      let stat;
+      try {
+        stat = fs.statSync(p);
+      } catch {
+        continue; // must exist
+      }
+      if (!stat.isDirectory()) continue; // must be a directory
+      const real = fs.realpathSync(p);
+      if (real !== scopeRoot && !extraRoots.includes(real)) extraRoots.push(real);
+    }
+  }
+
+  let disagreement = null;
+  const rootUri = params.rootUri;
+  if (typeof rootUri === 'string') {
+    try {
+      const url = new URL(rootUri);
+      if (url.protocol === 'file:') {
+        const real = canonicalizeBestEffort(fileURLToPath(url));
+        if (real !== scopeRoot) {
+          disagreement = `rootUri (${real}) disagrees with cwd (${scopeRoot}) — cwd wins (session identity)`;
+        }
+      }
+    } catch {
+      // unparseable/non-file rootUri: nothing to compare
+    }
+  }
+
+  return { extraRoots, disagreement };
+}
+
 // Pure decision function, injectable for unit testing without filesystem
 // gymnastics: given a parsed message, the running forwardedUris Set (mutated
 // in place — same lifetime as the filter), and a classify(uri) function
@@ -375,7 +454,10 @@ function decideForward(msg, forwardedUris, classify) {
 // FRAME is a different failure (handled inside shouldForward): that frame is
 // passed through and parsing resumes at the next frame, because boundaries
 // are still known-good.
-function makeFilter(scopeRoot, writer) {
+// `roots` is a live array reference (R3/R5): callers may push additional
+// validated workspaceFolders onto it after construction; every classify
+// call reads it fresh.
+function makeFilter(roots, writer) {
   let buf = Buffer.alloc(0);
   let failedOpen = false;
   const forwardedUris = new Set();
@@ -421,7 +503,7 @@ function makeFilter(scopeRoot, writer) {
     } catch {
       return true; // per-frame parse failure: pass through, don't classify
     }
-    return decideForward(msg, forwardedUris, (uri) => classifyFileUri(uri, [scopeRoot]));
+    return decideForward(msg, forwardedUris, (uri) => classifyFileUri(uri, roots));
   }
 
   function flush() {
@@ -438,4 +520,5 @@ if (require.main === module) main();
 module.exports = {
   makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities,
   decideForward, makeOrderedWriter, exitCodeFor, canonicalizeBestEffort, isWithinRoot, classifyFileUri,
+  extractRootEvidence,
 };

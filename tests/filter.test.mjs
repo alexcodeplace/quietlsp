@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
-const { decideForward, exitCodeFor, canonicalizeBestEffort, isWithinRoot, classifyFileUri } = await import(pathToFileURL(QUIETLSP).href);
+const { decideForward, exitCodeFor, canonicalizeBestEffort, isWithinRoot, classifyFileUri, extractRootEvidence } = await import(pathToFileURL(QUIETLSP).href);
 
 function frame(obj) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -295,6 +295,51 @@ test('R4: a symlinked directory is resolved before containment check (out-of-tre
   assert.equal(res.status, 0, res.stderr?.toString());
   assert.deepEqual(parseFrames(res.stdout), []);
   fs.rmSync(realOutside, { recursive: true, force: true });
+});
+
+test('R5: workspaceFolders that exist and are directories become extra allowed roots', () => {
+  const extraDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-extra-root-'));
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { workspaceFolders: [{ uri: uriFor(extraDir), name: 'x' }] } };
+  const evidence = extractRootEvidence(init, tmpRoot);
+  assert.deepEqual(evidence.extraRoots, [fs.realpathSync(extraDir)]);
+  fs.rmSync(extraDir, { recursive: true, force: true });
+});
+
+test('R5: workspaceFolders entries that do not exist or are files (not dirs) are rejected', () => {
+  const notADir = path.join(tmpRoot, 'not-a-dir.txt');
+  fs.writeFileSync(notADir, '');
+  const init = {
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { workspaceFolders: [{ uri: uriFor(notADir) }, { uri: uriFor(path.join(tmpRoot, 'does-not-exist')) }] },
+  };
+  const evidence = extractRootEvidence(init, tmpRoot);
+  assert.deepEqual(evidence.extraRoots, []);
+});
+
+test('R3: rootUri disagreeing with cwd is logged, not acted on', () => {
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-other-root-'));
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { rootUri: uriFor(other) } };
+  const evidence = extractRootEvidence(init, tmpRoot);
+  assert.ok(evidence.disagreement && evidence.disagreement.includes(fs.realpathSync(other)));
+  fs.rmSync(other, { recursive: true, force: true });
+});
+
+test('R3: rootUri matching cwd reports no disagreement', () => {
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { rootUri: uriFor(tmpRoot) } };
+  const evidence = extractRootEvidence(init, fs.realpathSync(tmpRoot));
+  assert.equal(evidence.disagreement, null);
+});
+
+test('R5 end-to-end: a diagnostic for a workspaceFolder outside cwd is forwarded, not dropped', () => {
+  const extraDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-extra-root-e2e-'));
+  const extraFile = path.join(extraDir, 'gen.ts');
+  fs.writeFileSync(extraFile, '');
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { workspaceFolders: [{ uri: uriFor(extraDir), name: 'x' }] } };
+  const diag = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(extraFile), diagnostics: [] } };
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [diag], stdinData: frame(init) });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  assert.deepEqual(parseFrames(res.stdout), [diag]);
+  fs.rmSync(extraDir, { recursive: true, force: true });
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });
