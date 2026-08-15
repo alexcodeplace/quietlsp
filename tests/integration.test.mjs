@@ -31,8 +31,11 @@ const RUST_ANALYZER_FUNCTIONAL = (() => {
   if (r.status !== 0) return false;
   const bin = r.stdout.toString('utf8').trim();
   const probe = spawnSync(bin, ['--version'], { timeout: 5000 });
-  // The rustup proxy on this box exits 1 with "unavailable for the active
-  // toolchain" — a functional rust-analyzer prints "rust-analyzer X.Y.Z".
+  // Correction 2026-08-16: on this box `command -v rust-analyzer` resolves
+  // to the ~/.cargo/bin rustup proxy, and its --version transparently falls
+  // back to the real /usr/bin/rust-analyzer and succeeds (exit 0) — this
+  // check already detects that correctly. See README "rustup proxy
+  // footgun" — do not assume the proxy itself is non-functional.
   return probe.status === 0 && /^rust-analyzer /.test(probe.stdout?.toString('utf8') ?? '');
 })();
 
@@ -182,9 +185,9 @@ if (!TSSERVER) {
 }
 
 if (!RUST_ANALYZER_FUNCTIONAL) {
-  console.log('GAP - integration: no functional rust-analyzer binary on this box (only a non-functional rustup proxy stub) — rust-analyzer push/pull integration case is structural only, not run here');
+  console.log('GAP - integration: no functional rust-analyzer binary on this box — rust-analyzer push/pull integration case is structural only, not run here');
 } else {
-  console.log('NOTE - functional rust-analyzer detected but no test wired for it (unexpected on this box; see SPEC.md R10)');
+  console.log('GAP - integration: functional rust-analyzer detected (/usr/bin/rust-analyzer) but the induced-diagnostic driveSession case is not wired for it yet — needs a real Cargo project per fixture dir and untangling rust-analyzer\'s own internal cargo resolution from this box\'s remote-build cargo PATH shim; see SPEC.md R10');
 }
 
 if (process.exitCode) {

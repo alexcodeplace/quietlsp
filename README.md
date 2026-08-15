@@ -82,27 +82,49 @@ on disk right now; they are not what makes the shim survive a deploy.
   next. One log line each for the capability rewrite, any `rootUri`/cwd
   disagreement, and any framing error, to
   `~/.local/state/overdeck/quietlsp.log`.
-- `install-quietlsp` — idempotent installer. Discovers every version dir
-  under the `typescript-lsp` and `rust-analyzer-lsp` plugin caches, resolves
-  each command's real binary (skipping its own shim dirs during the
+- `install-quietlsp` — idempotent installer. Resolves each command's real
+  binary on `$HOME/.claude/bin` (skipping its own shim dir during the
   search), validates every target before writing any of them, and
-  writes/refreshes a shim in `<version-dir>/bin/`. Every successful install
-  is recorded (dest, real binary, hash, mode, timestamp) under
-  `~/.local/state/quietlsp/installs/`.
+  writes/refreshes a shim there. Local/manual install and `--status` audit
+  tool — see "Durability" above for why it is not the durable mechanism on a
+  deploy-managed box.
   - `install-quietlsp` — install/repair.
   - `install-quietlsp --status` — per-target `wrapped` / `UNWRAPPED` /
     `DRIFTED` (content mismatch OR a failed launch probe); exits non-zero
     unless everything is `wrapped`.
-  - `install-quietlsp --uninstall` — removes only shims this tool recorded
-    installing, and clears those records (the real installs at
-    `/usr/local/bin` and `~/.cargo/bin` were never touched).
+  - `install-quietlsp --uninstall` — removes only shims this tool installed.
 - `tests/filter.test.mjs` — framed-stream fixture tests for the wrapper.
 - `tests/installer.test.sh` — installer idempotency and `--status` verdict
   tests, run entirely inside a throwaway sandbox.
 - `tests/integration.test.mjs` — drives a real session against the installed
   `typescript-language-server`; skips itself (loudly) if that binary isn't
-  present, and reports a named gap if only a non-functional `rustup` proxy
-  stub exists for `rust-analyzer`.
+  present. For `rust-analyzer`, detects a functional binary correctly
+  (`/usr/bin/rust-analyzer` on this box) but has no induced-diagnostic
+  driveSession case wired for it yet — named gap, see SPEC.md R10.
+
+### `rustup` proxy footgun (found 2026-08-16)
+
+`~/.cargo/bin/rust-analyzer` is usually a `rustup` toolchain proxy, not a
+real binary — `readlink -f` lands on `rustup` itself. **Do not conclude
+"rust-analyzer not installed" from that proxy alone**: when the active
+toolchain lacks the `rust-analyzer` component, the proxy prints
+`info: 'rust-analyzer' is unavailable for the active toolchain` to stderr
+and then, on this box, transparently falls back to a real binary elsewhere
+on `PATH` (`/usr/bin/rust-analyzer`) for at least `--version` and `--help` —
+exit 0, real output. Always check for a real binary elsewhere on `PATH`
+(`which -a rust-analyzer`) before concluding it's absent.
+
+**More importantly:** that fallback is itself PATH-based — the proxy does
+its own search for the next `rust-analyzer` on PATH, not a fixed path to
+`/usr/bin`. If a shim sits on PATH ahead of the real binary (exactly the
+`~/.claude/bin` attach point this repo uses), the proxy's fallback search
+finds *that shim* instead — confirmed as a real, reproducible infinite fork
+loop (the proxy re-invokes the shim, which re-resolves and can land on the
+proxy again). `_quietlsp-shim.sh` in the Overdeck repo handles this two
+ways: it never treats a candidate that resolves to a binary literally named
+`rustup` as usable (validated or fallback), and it strips its own directory
+from `PATH` before spawning any subprocess (probe or real exec), so even an
+unrelated future proxy with the same habit can't rediscover the shim.
 
 ## Re-run after a plugin version bump
 
