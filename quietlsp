@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+// quietlsp — cwd-scoped LSP diagnostics filter.
+//
+// Sits between a Claude Code language-server plugin and the real language
+// server binary. Client->server bytes pass through untouched. Server->client
+// bytes are parsed as Content-Length-framed JSON-RPC (LSP); a
+// textDocument/publishDiagnostics notification whose uri resolves outside
+// this process's cwd subtree is dropped whole. Everything else passes
+// byte-identical. Any framing/parse error permanently switches the rest of
+// the stream to raw passthrough (a broken LSP is worse than noisy
+// diagnostics) and logs once to ~/.local/state/overdeck/quietlsp.log.
+//
+// Usage: quietlsp <real-binary-absolute-path> [args...]
+
+'use strict';
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { fileURLToPath } = require('node:url');
+
+const LOG_PATH = path.join(os.homedir(), '.local/state/overdeck/quietlsp.log');
+
+function logOnce(msg) {
+  try {
+    fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
+    fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    // Logging must never be why the stream breaks.
+  }
+}
+
+function main() {
+  const [realBin, ...realArgs] = process.argv.slice(2);
+  if (!realBin) {
+    process.stderr.write('quietlsp: usage: quietlsp <real-binary-path> [args...]\n');
+    process.exit(2);
+  }
+
+  let scopeRoot;
+  try {
+    scopeRoot = fs.realpathSync(process.cwd());
+  } catch {
+    scopeRoot = process.cwd();
+  }
+
+  const child = spawn(realBin, realArgs, { stdio: ['pipe', 'pipe', 'inherit'] });
+
+  child.on('error', (err) => {
+    logOnce(`FATAL spawn ${realBin}: ${err.message}`);
+    process.exitCode = 127;
+  });
+
+  // client -> server: untouched, unbuffered.
+  process.stdin.pipe(child.stdin);
+
+  const filter = makeFilter(scopeRoot, () => {
+    // Fail-open: from here on, raw passthrough for the rest of the stream.
+    child.stdout.unpipe();
+    child.stdout.pipe(process.stdout);
+  });
+  child.stdout.on('data', (chunk) => filter.push(chunk));
+
+  const forward = (sig) => {
+    try { child.kill(sig); } catch { /* already gone */ }
+  };
+  ['SIGINT', 'SIGTERM', 'SIGHUP'].forEach((sig) => process.on(sig, () => forward(sig)));
+
+  // 'close', not 'exit': 'exit' fires as soon as the child process terminates,
+  // but buffered stdout data can still be delivered as 'data' events after
+  // that — exiting on 'exit' truncates output. 'close' waits for all stdio
+  // streams to finish.
+  child.on('close', (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? 0);
+  });
+}
+
+// Returns { push(chunk) }. On any framing error, calls onFailOpen() once and
+// stops parsing (caller re-pipes raw bytes directly).
+function makeFilter(scopeRoot, onFailOpen) {
+  let buf = Buffer.alloc(0);
+  let failedOpen = false;
+
+  function push(chunk) {
+    if (failedOpen) return; // caller has re-piped; nothing left to do here
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    try {
+      drain();
+    } catch (err) {
+      failOpen(err, buf);
+    }
+  }
+
+  function failOpen(err, remainder) {
+    if (failedOpen) return;
+    failedOpen = true;
+    logOnce(`framing error, switching to passthrough: ${err && err.message}`);
+    if (remainder && remainder.length) process.stdout.write(remainder);
+    onFailOpen();
+  }
+
+  function drain() {
+    for (;;) {
+      const headerEnd = buf.indexOf('\r\n\r\n');
+      if (headerEnd === -1) {
+        if (buf.length > 64 * 1024) throw new Error('header exceeds 64KiB without terminator');
+        return; // need more data
+      }
+      const headerText = buf.slice(0, headerEnd).toString('ascii');
+      const lenMatch = /Content-Length:\s*(\d+)/i.exec(headerText);
+      if (!lenMatch) throw new Error(`missing Content-Length in header: ${JSON.stringify(headerText)}`);
+      const contentLength = Number(lenMatch[1]);
+      if (!Number.isFinite(contentLength) || contentLength < 0) {
+        throw new Error(`invalid Content-Length: ${lenMatch[1]}`);
+      }
+      const bodyStart = headerEnd + 4;
+      const bodyEnd = bodyStart + contentLength;
+      if (buf.length < bodyEnd) return; // need more data
+
+      const frame = buf.slice(0, bodyEnd); // header + body, exact original bytes
+      const body = buf.slice(bodyStart, bodyEnd);
+      buf = buf.slice(bodyEnd);
+
+      if (shouldDrop(body)) {
+        // dropped whole: nothing written
+      } else {
+        process.stdout.write(frame);
+      }
+    }
+  }
+
+  function shouldDrop(bodyBuf) {
+    let msg;
+    try {
+      msg = JSON.parse(bodyBuf.toString('utf8'));
+    } catch {
+      throw new Error('body is not valid JSON');
+    }
+    if (msg.method !== 'textDocument/publishDiagnostics') return false;
+    const uri = msg.params && msg.params.uri;
+    if (typeof uri !== 'string') return false;
+    let filePath;
+    try {
+      filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
+    } catch {
+      return false; // not a resolvable file uri: never drop what we can't classify
+    }
+    let real;
+    try {
+      real = fs.realpathSync(filePath);
+    } catch {
+      real = path.resolve(filePath); // file may not exist on disk yet (rare); best effort
+    }
+    const rel = path.relative(scopeRoot, real);
+    return rel === '' ? false : rel.startsWith('..') || path.isAbsolute(rel);
+  }
+
+  return { push };
+}
+
+if (require.main === module) main();
+
+module.exports = { makeFilter };

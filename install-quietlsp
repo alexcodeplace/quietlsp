@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# install-quietlsp — wrap the TypeScript and rust-analyzer language servers so
+# Claude Code's LSP feature only ever receives diagnostics for files inside
+# the session's own cwd subtree.
+#
+# ATTACH POINT (found by investigation, not assumed): Claude Code prepends
+# <plugin-cache>/<plugin>/<version>/bin to PATH ahead of every system
+# location, for exactly the two LSP plugins this wraps. That bin/ directory
+# does not exist by default — nothing in the plugin ships it, and nothing in
+# the plugin's own tracked files is ever touched. install-quietlsp creates it
+# and drops a shim there named for the real command (typescript-language-server /
+# rust-analyzer). The shim shadows the real npm/cargo install at
+# /usr/local/bin and ~/.cargo/bin (never edited) via ordinary PATH precedence.
+# NEVER hand-edit anything inside ~/.claude/plugins/cache/**/README.md or
+# other tracked plugin files — a plugin update reverts them silently.
+#
+# Idempotent, modeled on ~/.claude/bin/install-headless-guard: rerun after
+# every plugin update (a version bump creates a NEW version dir with no bin/
+# of its own — both old and new must be wrapped, same lesson as
+# security-guidance 2.0.6+2.0.7).
+set -uo pipefail
+
+MARKER_FAMILY="quietlsp-guard"
+MARKER="$MARKER_FAMILY v1"
+SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+QUIETLSP_BIN="$SELF_DIR/quietlsp"
+CACHE_ROOT="${QUIETLSP_PLUGIN_CACHE:-$HOME/.claude/plugins/cache/claude-plugins-official}"
+NODE_BIN="$(command -v node || true)"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: install-quietlsp [--uninstall] [--status]
+
+Wraps the TypeScript and rust-analyzer language servers so Claude Code's LSP
+feature only receives diagnostics for files inside a session's own cwd.
+
+  --status     report wrapped/unwrapped/drifted per discovered plugin version
+               dir, exit 1 if any target is not `wrapped`
+  --uninstall  remove every shim this installer created (real installs at
+               /usr/local/bin and ~/.cargo/bin were never touched)
+USAGE
+  exit "${1:-2}"
+}
+
+RUN_MODE=install
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall) RUN_MODE=uninstall; shift ;;
+    --status)    RUN_MODE=status; shift ;;
+    -h|--help)   usage 0 ;;
+    *)           echo "install-quietlsp: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+if [ -z "$NODE_BIN" ]; then
+  echo "install-quietlsp: FATAL no node on PATH — quietlsp requires node" >&2
+  exit 1
+fi
+[ -x "$QUIETLSP_BIN" ] || { echo "install-quietlsp: FATAL missing wrapper at $QUIETLSP_BIN" >&2; exit 1; }
+
+# name:plugin — plugin dir name under $CACHE_ROOT to scan for version dirs.
+TARGETS=(
+  "typescript-language-server:typescript-lsp"
+  "rust-analyzer:rust-analyzer-lsp"
+)
+
+# Resolves the real (non-quietlsp) absolute binary for a command name by
+# walking PATH and skipping any entry that is one of our own shim dirs.
+resolve_real() {
+  local cmd=$1 entry cand
+  IFS=':' read -ra parts <<<"$PATH"
+  for entry in "${parts[@]}"; do
+    case "$entry" in
+      "$CACHE_ROOT"/*/*/bin) continue ;;  # never resolve through our own shim dirs
+    esac
+    cand="$entry/$cmd"
+    if [ -x "$cand" ] && [ ! -d "$cand" ]; then
+      readlink -f -- "$cand" 2>/dev/null || echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+shim_body() {
+  local cmd=$1 real=$2
+  cat <<SHIM
+#!/usr/bin/env bash
+# $MARKER — DO NOT EDIT. Reinstall with install-quietlsp (from the quietlsp repo).
+exec "$NODE_BIN" "$QUIETLSP_BIN" "$real" "\$@"
+SHIM
+}
+
+is_shim() { grep -qF "$MARKER_FAMILY" <(head -c 200 -- "$1" 2>/dev/null); }
+shim_is_current() { [ "$(cat -- "$1" 2>/dev/null)" = "$(shim_body "$2" "$3")" ]; }
+
+wrapped=0; refreshed=0; current=0; unwrapped=0; stale=0; restored=0; skipped=0
+
+for target in "${TARGETS[@]}"; do
+  cmd="${target%%:*}"; plugin="${target##*:}"
+  plugin_root="$CACHE_ROOT/$plugin"
+  [ -d "$plugin_root" ] || { echo "install-quietlsp: no $plugin cache dir — skipping $cmd" >&2; skipped=$((skipped+1)); continue; }
+
+  real="$(resolve_real "$cmd" || true)"
+  if [ -z "$real" ]; then
+    echo "install-quietlsp: WARN no real '$cmd' found on PATH outside our own shim dirs — skipping" >&2
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  found_version=0
+  for version_dir in "$plugin_root"/*/; do
+    [ -d "$version_dir" ] || continue
+    found_version=1
+    bin_dir="${version_dir%/}/bin"
+    dest="$bin_dir/$cmd"
+
+    case "$RUN_MODE" in
+      install)
+        mkdir -p "$bin_dir" || { echo "install-quietlsp: FATAL cannot create $bin_dir" >&2; exit 1; }
+        if [ -e "$dest" ] && ! is_shim "$dest"; then
+          echo "install-quietlsp: FATAL $dest exists and is not a quietlsp shim — refusing to overwrite" >&2
+          exit 1
+        fi
+        if [ -e "$dest" ] && shim_is_current "$dest" "$cmd" "$real"; then
+          current=$((current+1)); continue
+        fi
+        tmp="$dest.quietlsp.$$"
+        shim_body "$cmd" "$real" >"$tmp" || { rm -f -- "$tmp"; echo "install-quietlsp: FATAL cannot write $dest" >&2; exit 1; }
+        chmod 755 "$tmp"
+        if [ -e "$dest" ]; then refreshed=$((refreshed+1)); else wrapped=$((wrapped+1)); fi
+        mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; echo "install-quietlsp: FATAL cannot install $dest" >&2; exit 1; }
+        ;;
+      status)
+        if [ ! -e "$dest" ]; then
+          unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest"
+        elif ! is_shim "$dest"; then
+          unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest (foreign file, not a quietlsp shim)"
+        elif shim_is_current "$dest" "$cmd" "$real"; then
+          wrapped=$((wrapped+1))
+        else
+          stale=$((stale+1)); echo "DRIFTED $dest"
+        fi
+        ;;
+      uninstall)
+        if [ -e "$dest" ] && is_shim "$dest"; then
+          rm -f -- "$dest" && restored=$((restored+1))
+          rmdir -- "$bin_dir" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  done
+  [ "$found_version" -eq 1 ] || echo "install-quietlsp: no version dirs under $plugin_root — skipping $cmd" >&2
+done
+
+case "$RUN_MODE" in
+  install)   echo "install-quietlsp: wrapped=$wrapped refreshed=$refreshed current=$current skipped=$skipped" ;;
+  uninstall) echo "install-quietlsp: restored=$restored" ;;
+  status)
+    echo "install-quietlsp: wrapped=$wrapped stale=$stale unwrapped=$unwrapped skipped=$skipped"
+    [ "$unwrapped" -eq 0 ] && [ "$stale" -eq 0 ] || exit 1 ;;
+esac
