@@ -1,55 +1,69 @@
 # QuietLSP — cwd-scoped LSP diagnostics filter
 
 audience: AI coding agents first. Spec = contract; implementer owns bodies.
+v1 shipped 2026-08-15; v1.1 amendments below fold in the external review (gpt-5.6-sol, log 20260815-213926) — findings referenced as R1..R12.
 
 ## Purpose
 
-Claude Code's language-server feature injects `new-diagnostics` blocks into agent context with no per-file scoping — sessions receive TypeScript/Rust errors from OTHER worktrees and other sessions' half-finished edits (measured 2026-08-15: hundreds of irrelevant lines per interactive session, ×~50 sessions; harness v2.1.233 offers only per-language on/off). QuietLSP sits between the plugin and the real language server and drops diagnostics for files outside the session's working tree, so the harness never receives the noise. Sibling product to QuietContext: same mission (protect agent context), adjacent layer (editor diagnostics vs command output).
+Claude Code's language-server feature injects `new-diagnostics` blocks into agent context with no per-file scoping — sessions receive TypeScript/Rust errors from OTHER worktrees and other sessions' half-finished edits (measured 2026-08-15; harness v2.1.233 offers only per-language on/off). QuietLSP sits between the plugin and the real language server and drops diagnostics for files outside the session's working tree. Sibling product to QuietContext: same mission (protect agent context), adjacent layer.
 
 ## Non-goals
 
-- Never edit the plugin cache (`~/.claude/plugins/...`) — updates silently revert hand edits (proven 2026-08-15, security-plugin incident). QuietLSP attaches to what the plugin EXECUTES.
-- No severity filtering, no message rewriting, no diagnostics dedup in v1 — drop-or-pass whole notifications only.
-- Not a general LSP proxy framework. One job.
+- Never MODIFY files inside the plugin cache. v1 attach (verified): Claude Code prepends `~/.claude/plugins/cache/claude-plugins-official/<plugin>/<version>/bin` to PATH for these plugins; QuietLSP CREATES that reserved, otherwise-absent bin dir and drops a same-named shim — no tracked plugin file is edited, updates cannot revert it, a new version dir just needs `install-quietlsp` re-run. (R2 resolved: this IS the "stable external interception point"; the spec's earlier rename-real+shim language was superseded by the discovered mechanism.)
+- No severity filtering, no dedup. Message REWRITING is permitted in exactly one place: the capability rewrite in R1 below.
+- Not a general LSP proxy framework.
 
 ## Architecture
 
 ```
-claude-code plugin ──spawns──> quietlsp (wrapper) ──spawns──> real language server
-   client→server bytes: passthrough, untouched, unbuffered
-   server→client bytes: parse LSP framing; drop out-of-tree publishDiagnostics; pass all else
+claude-code plugin ──PATH──> quietlsp shim ──spawns──> real language server
+   client→server: passthrough EXCEPT the initialize capability rewrite (below)
+   server→client: parse LSP framing; filter diagnostics; pass all else
 ```
 
-- Attach mechanism: discovered by investigation (bundled binary per plugin version dir / PATH lookup / absolute path). Wrapper shape follows `install-headless-guard`'s rename-real+shim pattern for whichever point the plugin executes. The investigation result is recorded in README with evidence.
-- Scope rule: a `textDocument/publishDiagnostics` notification is DROPPED iff its `uri` resolves outside the wrapper process's cwd subtree (session cwd = the session's worktree). Symlinks resolved before comparison. Everything else — all requests, responses, other notifications — passes byte-identical.
-- Framing: LSP = Content-Length-framed JSON-RPC over stdio. Passed messages keep their original bytes; dropped messages are removed whole (no mutation → no Content-Length recompute except omission).
+### Diagnostics model — push vs pull (R1, CRITICAL)
 
-## Fail-open contract (load-bearing)
+rust-analyzer switches from push `publishDiagnostics` to PULL (`textDocument/diagnostic`, LSP 3.17) when the client advertises `textDocument.diagnostic`; a publish-only filter does nothing in pull mode. v1.1 contract: the wrapper parses the client's `initialize` request and REMOVES `textDocument.diagnostic` from advertised capabilities, forcing push mode for every server — the one sanctioned client→server mutation (Content-Length recomputed for that frame only). The wrapper logs the original and rewritten capability sets once per session. If a future harness requires pull mode, the alternative (filter pull responses by request-ID correlation) becomes a new slice — not silently absent.
 
-Any framing/parse error, or any internal wrapper error → permanent byte-passthrough for the remainder of the stream + ONE log line to `~/.local/state/overdeck/quietlsp.log`. A broken LSP is worse than noisy diagnostics. The wrapper must never delay shutdown: real server exit → wrapper exits with same code; signals forwarded.
+### Scope rule
+
+- Root: captured ONCE at startup — wrapper cwd, canonicalized (symlinks resolved). The wrapper records root + the client's `rootUri`/`workspaceFolders` from initialize to the log; if `rootUri` disagrees with cwd, the wrapper prefers cwd (session identity) and logs the disagreement (R3: evidence, not assumption).
+- Eligible for filtering: local `file:` URIs only (percent-decoded, empty/localhost authority). `untitled:`, virtual, remote schemes pass unchanged (R4).
+- Containment: component-based path-prefix against the canonical root; nonexistent paths resolve through their deepest existing canonical ancestor (R4).
+- Out-of-root but legitimate documents (project references, generated sources): v1.1 additionally ALLOWS any root listed in the client's initialize `workspaceFolders` (validated: must exist, be a directory). Extra-roots config file stays roadmap (R5 — partial promotion).
+
+### Clear-state correctness (R6)
+
+`publishDiagnostics` is state REPLACEMENT; an empty array is how a server clears. The wrapper keeps a per-URI forwarded-set: an out-of-scope publication is dropped UNLESS that URI has a previously-forwarded publication, in which case an EMPTY publication passes (clearing stale client state) and the URI leaves the set. The `version` field is never altered. Test the allowed→denied→clear transition.
+
+## Fail-open contract (R7 — split)
+
+- FRAMING loss (invalid/absent Content-Length, damaged header, wrapper-wide I/O error) → permanent byte-passthrough for the rest of the stream + one log line: frame boundaries are untrustworthy.
+- Valid frame, unparseable/unclassifiable JSON → pass THAT frame unchanged, resume filtering at the next frame (boundaries still trustworthy). Buffered bytes are emitted exactly once.
+- Shutdown (R11): single ordered writer per direction; at most one declared body buffered; client EOF → close child stdin; drain child stdout before exit; exit with child's code (signal death → 128+n); forward TERM/INT/HUP; hard deadline 5s from child exit to wrapper exit.
 
 ## Installer contract (`install-quietlsp`)
 
-- Idempotent: re-run after every plugin update; discovers ALL plugin version dirs and wraps each (updates create NEW version dirs — both must be wrapped, per the 2.0.6/2.0.7 lesson).
-- `--status`: per discovered server binary → `wrapped` / `unwrapped` / `drifted` (wrapper present but stale vs repo copy). Exit non-zero if any target is not `wrapped`.
-- `--uninstall`: restores originals exactly.
-- Covers TypeScript AND rust-analyzer plugins. Unknown/indeterminate plugin layout → refuse loudly, wrap nothing (fail-closed on install, fail-open on traffic).
+- Idempotent; discovers ALL plugin version dirs; re-run after every plugin update.
+- Atomicity (R8): validate every target BEFORE any write; per-target atomic install (write temp + rename); refuse on collisions (existing foreign shim, nested wrapper); record per-target hashes + mode metadata under ~/.local/state so uninstall provably restores/removes exactly what was installed.
+- `--status` (R9): `wrapped` = full tuple — recognized plugin/version, shim present + hash matches repo copy, real server resolvable, shim launch probe succeeds. Anything else recognized = `drifted`; pristine = `unwrapped`. Exit non-zero unless all wrapped.
+- `--uninstall`: removes only recorded installs.
+- Unknown/indeterminate layout → refuse loudly, wrap nothing.
 
 ## Test strategy
 
-- Framed-stream fixture: in-tree diagnostics pass byte-exact; out-of-tree dropped; interleaved messages keep valid framing; malformed frame → passthrough mode from that point; large message split across chunk boundaries reassembled correctly.
-- Handshake: real language server through the wrapper completes `initialize` and responds.
-- Installer: run-twice idempotency; `--status` verdicts for all three states; `--uninstall` restores byte-identical originals.
+- Framed-stream fixtures: in-tree pass byte-exact; out-of-tree drop; clear-state transition; capability rewrite of initialize (and only initialize); per-frame parse-fail recovery vs framing-loss permanent passthrough; chunk-boundary reassembly.
+- Integration (R10): against the INSTALLED typescript-language-server — record negotiated capabilities, induce a real diagnostic in-tree and in a sibling worktree, assert the sibling's is dropped and the in-tree one arrives, assert unrelated traffic byte-identical. rust-analyzer equivalent gated on a rust-analyzer binary existing on the box (absent today — named gap).
+- Installer: idempotency, all three --status verdicts, uninstall restores recorded state.
 
-## Acceptance (v1 done =)
+## Acceptance (v1.1 done =)
 
-1. Installed on this workstation, both language servers wrapped, `--status` clean.
-2. LSP still functional through the wrapper (handshake proof).
-3. An interactive session in worktree A no longer receives diagnostics for files in worktree B (owner/orchestrator verifies — dispatched subagents cannot activate the LSP feature).
-4. Repo private on GitHub, tests green, README documents the attach mechanism and the re-run-after-update step.
+1. `--status` clean on this workstation.
+2. Integration test above green and SAVED as a rerunnable artifact in tests/ (R12 — proof is a test, not an attestation).
+3. Capability rewrite verified in the recorded initialize exchange.
+4. Cross-worktree noise absence in an interactive session remains the operational check (owner-observed; cannot be produced by dispatched sessions) — checklist item, not acceptance.
 
-## Roadmap (post-v1, owner-gated)
+## Roadmap (owner-gated)
 
-- Config file for extra allowed roots (monorepo sessions legitimately watching siblings).
-- Drift audit wired into the fleet check pass alongside install-headless-guard.
-- Publication (public repo / marketplace) — owner decision, not a lane's.
+- Pull-diagnostics filtering by request-ID correlation (if a harness ever requires pull mode).
+- Extra allowed-roots config; fleet drift-audit wiring; publication.
