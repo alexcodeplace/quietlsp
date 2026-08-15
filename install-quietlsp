@@ -25,7 +25,17 @@ MARKER="$MARKER_FAMILY v1"
 SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
 QUIETLSP_BIN="$SELF_DIR/quietlsp"
 CACHE_ROOT="${QUIETLSP_PLUGIN_CACHE:-$HOME/.claude/plugins/cache/claude-plugins-official}"
-NODE_BIN="$(command -v node || true)"
+# Prefer the real system node over a dev-tool PATH shim (e.g. an offload/
+# remote-build wrapper): quietlsp is a live stdio proxy in front of the
+# session's own language server and must never be redirected to a build box
+# or gated on a package.json/lockfile heuristic that doesn't apply here.
+NODE_BIN="${QUIETLSP_NODE:-}"
+if [ -z "$NODE_BIN" ]; then
+  for cand in /usr/bin/node /usr/local/bin/node; do
+    [ -x "$cand" ] && ! head -c 4 -- "$cand" 2>/dev/null | grep -q '#!/u' && { NODE_BIN="$cand"; break; }
+  done
+fi
+[ -n "$NODE_BIN" ] || NODE_BIN="$(command -v node || true)"
 
 usage() {
   cat >&2 <<'USAGE'

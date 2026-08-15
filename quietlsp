@@ -60,6 +60,10 @@ function main() {
     child.stdout.pipe(process.stdout);
   });
   child.stdout.on('data', (chunk) => filter.push(chunk));
+  // A well-formed LSP stream never ends mid-frame, but if the child exits
+  // abruptly (crash/kill) any incomplete trailing bytes must still reach the
+  // client rather than vanish silently.
+  child.stdout.on('end', () => filter.flush());
 
   const forward = (sig) => {
     try { child.kill(sig); } catch { /* already gone */ }
@@ -159,7 +163,13 @@ function makeFilter(scopeRoot, onFailOpen) {
     return rel === '' ? false : rel.startsWith('..') || path.isAbsolute(rel);
   }
 
-  return { push };
+  function flush() {
+    if (failedOpen) return;
+    if (buf.length) process.stdout.write(buf); // incomplete trailing frame: emit raw rather than lose it
+    buf = Buffer.alloc(0);
+  }
+
+  return { push, flush };
 }
 
 if (require.main === module) main();
