@@ -222,9 +222,36 @@ function makeClientFilter(childStdin) {
 
 // Returns { push(chunk) }. On any framing error, calls onFailOpen() once and
 // stops parsing (caller re-pipes raw bytes directly).
+// Pure decision function, injectable for unit testing without filesystem
+// gymnastics: given a parsed message, the running forwardedUris Set (mutated
+// in place — same lifetime as the filter), and a classify(uri) function
+// returning true only for a definitively out-of-scope file uri, returns
+// whether the frame should be forwarded. publishDiagnostics is state
+// REPLACEMENT, not an event: an out-of-scope URI is dropped UNLESS it was
+// previously forwarded (in scope at the time), in which case exactly one
+// already-empty clear passes through so the client's stale state gets
+// cleared, then the URI leaves the set.
+function decideForward(msg, forwardedUris, classify) {
+  if (msg.method !== 'textDocument/publishDiagnostics') return true;
+  const uri = msg.params && msg.params.uri;
+  if (typeof uri !== 'string') return true;
+  if (!classify(uri)) {
+    forwardedUris.add(uri);
+    return true;
+  }
+  const diagnostics = msg.params && msg.params.diagnostics;
+  const isEmptyClear = Array.isArray(diagnostics) && diagnostics.length === 0;
+  if (isEmptyClear && forwardedUris.has(uri)) {
+    forwardedUris.delete(uri);
+    return true; // pass the already-empty publication through unmodified
+  }
+  return false;
+}
+
 function makeFilter(scopeRoot, onFailOpen) {
   let buf = Buffer.alloc(0);
   let failedOpen = false;
+  const forwardedUris = new Set();
 
   function push(chunk) {
     if (failedOpen) return; // caller has re-piped; nothing left to do here
@@ -250,24 +277,24 @@ function makeFilter(scopeRoot, onFailOpen) {
       if (!parsed) return;
       buf = parsed.rest;
 
-      if (shouldDrop(parsed.body)) {
-        // dropped whole: nothing written
-      } else {
+      if (shouldForward(parsed.body)) {
         process.stdout.write(parsed.frame);
       }
+      // else: dropped whole, nothing written
     }
   }
 
-  function shouldDrop(bodyBuf) {
+  function shouldForward(bodyBuf) {
     let msg;
     try {
       msg = JSON.parse(bodyBuf.toString('utf8'));
     } catch {
-      return false; // per-frame parse failure: pass through, don't classify
+      return true; // per-frame parse failure: pass through, don't classify
     }
-    if (msg.method !== 'textDocument/publishDiagnostics') return false;
-    const uri = msg.params && msg.params.uri;
-    if (typeof uri !== 'string') return false;
+    return decideForward(msg, forwardedUris, isOutOfScope);
+  }
+
+  function isOutOfScope(uri) {
     let filePath;
     try {
       filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
@@ -295,4 +322,4 @@ function makeFilter(scopeRoot, onFailOpen) {
 
 if (require.main === module) main();
 
-module.exports = { makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities };
+module.exports = { makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities, decideForward };

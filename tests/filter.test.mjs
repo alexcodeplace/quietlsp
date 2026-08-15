@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
+const { decideForward } = await import(pathToFileURL(QUIETLSP).href);
 
 function frame(obj) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -178,6 +179,36 @@ test('non-initialize client requests pass through as original bytes, not round-t
   assert.equal(res.status, 0, res.stderr?.toString());
   const echoed = res.stderr.toString('utf8').replace(/^ECHO:/, '');
   assert.equal(echoed, raw.toString('utf8'));
+});
+
+test('clear-state: allowed -> out-of-scope -> clear transition (decideForward unit)', () => {
+  const forwarded = new Set();
+  const uri = 'file:///out/of/scope.ts';
+  const outOfScope = (u) => u === uri; // classify: only our test uri is out of scope
+  // 1. Allowed while in scope (classify says in-scope for this call).
+  const allow = decideForward({ method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [{ m: 1 }] } }, forwarded, () => false);
+  assert.equal(allow, true);
+  assert.ok(forwarded.has(uri));
+  // 2. Denied once out of scope, non-empty: dropped, stays in forwarded set (not yet cleared).
+  const deny = decideForward({ method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [{ m: 2 }] } }, forwarded, outOfScope);
+  assert.equal(deny, false);
+  assert.ok(forwarded.has(uri));
+  // 3. Empty clear while out of scope: passes through once, then leaves the set.
+  const clear = decideForward({ method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [] } }, forwarded, outOfScope);
+  assert.equal(clear, true);
+  assert.equal(forwarded.has(uri), false);
+  // 4. A second empty publication for the same never-forwarded uri is dropped, not synthesized.
+  const dropAgain = decideForward({ method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [] } }, forwarded, outOfScope);
+  assert.equal(dropAgain, false);
+});
+
+test('out-of-tree clear passes once after an in-tree publication, then drops again', () => {
+  const nonEmpty = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(outTree), diagnostics: [{ message: 'x' }] } };
+  const emptyClear = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(outTree), diagnostics: [] } };
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [nonEmpty, emptyClear] });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  // Never forwarded (root never included outTree), so both are dropped.
+  assert.deepEqual(parseFrames(res.stdout), []);
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });
