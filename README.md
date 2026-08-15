@@ -14,7 +14,7 @@ the noise never reaches Claude Code core. Sibling project to
 [quietmode](../quietmode) (QuietContext): same mission — protect agent
 context — adjacent layer (editor diagnostics vs command output).
 
-## Attach mechanism (investigation result, 2026-08-15)
+## Attach mechanism (investigation result, corrected 2026-08-15)
 
 Neither `typescript-lsp` nor `rust-analyzer-lsp` bundles a server binary —
 their plugin dirs contain only `README.md`/`LICENSE`, and the README tells
@@ -22,23 +22,49 @@ the user to `npm install -g typescript-language-server` /
 `rustup component add rust-analyzer` themselves. The actual language server
 is resolved as a **bare command name on PATH** at spawn time
 (`typescript-language-server`, `rust-analyzer`), not a bundled binary and not
-an absolute path baked into plugin config.
+an absolute path baked into plugin config. That part held up.
 
-The load-bearing fact: Claude Code's own `PATH` already prepends
-`~/.claude/plugins/cache/claude-plugins-official/<plugin>/<version>/bin`
-ahead of every system location, for exactly these two LSP plugins — verified
-by inspecting `$PATH` in a live session. That directory does not exist by
-default (nothing ships it); it is a reserved override point. QuietLSP creates
-it and drops a same-named shim there, so ordinary PATH precedence — not any
-edit to a plugin-owned file — puts the filter in front of the real server.
+**An earlier version of this doc claimed Claude Code prepends
+`~/.claude/plugins/cache/claude-plugins-official/<plugin>/<version>/bin` to
+PATH specifically for LSP spawns, and shimmed there. That claim was wrong,**
+caught by checking `/proc/<pid>/environ` for live `typescript-language-server`
+processes: only 1 of 3 running instances had that directory in `PATH`, the
+other 2 (including one spawned *after* the plugin-cache shim was installed)
+had the plain system PATH with no plugin-bin entry at all. The 1-of-3 case
+was an artifact of that particular session's shell PATH carrying unrelated
+plugin-bin entries (`code-review/bin`, `feature-dev/bin`, etc.) from its own
+terminal setup — not something Claude Code's core constructs per LSP spawn.
+Shimming inside the plugin cache does not reliably intercept anything.
 
-This is why QuietLSP never touches anything under `~/.claude/plugins/cache`
-that the plugin itself tracks (a plugin update silently reverts hand edits to
-tracked files — proven 2026-08-15 on the `security-guidance` plugin). The
-`bin/` directory it adds is new, untracked, and plugin-update-safe by
-construction: an update creates a *new* version dir with no `bin/` of its
-own, which is exactly why re-running the installer after every update is
-part of the contract (see `2.0.6`+`2.0.7` precedent for `security-guidance`).
+**What IS reliable:** `$HOME/.claude/bin` is first on `PATH` in every sampled
+session — including both processes that spawned
+`/usr/local/bin/typescript-language-server` directly with no shim anywhere
+in the chain — and in a fresh login shell. QuietLSP shadows the real command
+names there (`~/.claude/bin/typescript-language-server`,
+`~/.claude/bin/rust-analyzer`), the same house pattern already used for
+`node`/`pnpm`/`npm`/`vitest`/`tsc` (see `~/.claude/bin/_cpu-guard-shim.sh`
+for the sibling family — this repo does not touch that script or its
+symlinks, it only adds two new, independent files next to them).
+
+This is also why QuietLSP never touches anything under
+`~/.claude/plugins/cache` — a plugin update silently reverts hand edits to
+files it tracks (proven 2026-08-15 on the `security-guidance` plugin), and
+in any case that tree is no longer the attach point.
+
+**Known residual gap:** if a future plugin update starts bundling its own
+server binary at an absolute path outside PATH resolution, this shim stops
+applying and the installer needs a new attach point re-derived the same way
+(inspect `/proc/<pid>/environ` and the real spawn chain of a running server,
+don't infer from a single session's PATH).
+
+**Durability, box-specific (2026-08-15):** on this machine `$HOME/.claude/bin`
+is itself a deploy-managed symlink into an Overdeck deploy clone — anything
+`install-quietlsp` writes there directly holds only until the next
+`packaging/deploy-local.sh` convergence, then reverts. The durable copy on
+this box is the shim source landed in the Overdeck repo
+(`modules/workstation/claude/bin/`, deploy-installed there). `install-quietlsp`
+and `--status` still work for a local/manual install or for auditing what's
+on disk right now; they are not what makes the shim survive a deploy.
 
 ## Files
 

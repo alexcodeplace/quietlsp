@@ -3,61 +3,60 @@
 # Claude Code's LSP feature only ever receives diagnostics for files inside
 # the session's own cwd subtree.
 #
-# ATTACH POINT (found by investigation, not assumed): Claude Code prepends
-# <plugin-cache>/<plugin>/<version>/bin to PATH ahead of every system
-# location, for exactly the two LSP plugins this wraps. That bin/ directory
-# does not exist by default — nothing in the plugin ships it, and nothing in
-# the plugin's own tracked files is ever touched. install-quietlsp creates it
-# and drops a shim there named for the real command (typescript-language-server /
-# rust-analyzer). The shim shadows the real npm/cargo install at
-# /usr/local/bin and ~/.cargo/bin (never edited) via ordinary PATH precedence.
-# NEVER hand-edit anything inside ~/.claude/plugins/cache/**/README.md or
-# other tracked plugin files — a plugin update reverts them silently.
+# ATTACH POINT (corrected 2026-08-15, replaces an earlier wrong claim — see
+# README "Attach mechanism" for the full story): NOT a Claude-Code-constructed
+# per-LSP-spawn PATH prepend into the plugin cache version dir. Direct
+# /proc/<pid>/environ inspection of live typescript-language-server processes
+# showed that PATH entry present in only 1 of 3 running instances (a resumed
+# session whose shell had it via unrelated PATH accretion) and ABSENT from
+# the other 2, including one spawned after this installer had already run.
+# Not reliable — do not use it.
 #
-# Idempotent, modeled on ~/.claude/bin/install-headless-guard: rerun after
-# every plugin update (a version bump creates a NEW version dir with no bin/
-# of its own — both old and new must be wrapped, same lesson as
-# security-guidance 2.0.6+2.0.7).
+# What IS reliable, confirmed across every sampled process (including the
+# two that spawn /usr/local/bin/typescript-language-server directly with no
+# shim in the chain) and in a fresh login shell: $HOME/.claude/bin is first
+# on PATH, ahead of /usr/local/bin and ~/.cargo/bin, in every session. This
+# installer shadows the real command names there — the same house pattern
+# already used for node/pnpm/npm/vitest/tsc (see
+# ~/.claude/bin/_cpu-guard-shim.sh) — rather than editing the neighboring
+# shim family's dispatch script.
 #
-# Atomicity (R8): every target is validated BEFORE any write; a single
-# collision anywhere refuses the WHOLE run rather than partially installing.
-# Each write is temp-file-then-rename. Every successful install is recorded
-# under $STATE_DIR (dest, real, hash, mode, timestamp) so --uninstall
-# provably removes only what this installer put there.
+# NEVER hand-edit anything inside ~/.claude/plugins/cache — a plugin update
+# reverts tracked files silently. This installer never touches that tree.
+#
+# DURABILITY (2026-08-15): on this box $HOME/.claude/bin is itself a
+# deploy-managed symlink (Overdeck's packaging/deploy-local.sh convergence
+# overwrites it). A shim this installer writes there directly is transient —
+# it holds until the next deploy, then reverts. The durable copy is the shim
+# source landed in the Overdeck repo (modules/workstation/claude/bin/),
+# deploy-installed alongside it. This installer/its --status remain useful
+# for a local/manual install or for auditing what's currently on disk; they
+# are not the durable mechanism and never write to a location this box
+# doesn't own outright.
+#
+# Idempotent, modeled on ~/.claude/bin/install-headless-guard.
 set -uo pipefail
 
 MARKER_FAMILY="quietlsp-guard"
-MARKER="$MARKER_FAMILY v1"
+MARKER="$MARKER_FAMILY v2"
 SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
 QUIETLSP_BIN="$SELF_DIR/quietlsp"
-CACHE_ROOT="${QUIETLSP_PLUGIN_CACHE:-$HOME/.claude/plugins/cache/claude-plugins-official}"
-STATE_DIR="${QUIETLSP_STATE_DIR:-$HOME/.local/state/quietlsp}"
-RECORDS_DIR="$STATE_DIR/installs"
-# Prefer the real system node over a dev-tool PATH shim (e.g. an offload/
-# remote-build wrapper): quietlsp is a live stdio proxy in front of the
-# session's own language server and must never be redirected to a build box
-# or gated on a package.json/lockfile heuristic that doesn't apply here.
+SHIM_DIR="${QUIETLSP_SHIM_DIR:-$HOME/.claude/bin}"
 NODE_BIN="${QUIETLSP_NODE:-}"
-if [ -z "$NODE_BIN" ]; then
-  for cand in /usr/bin/node /usr/local/bin/node; do
-    [ -x "$cand" ] && ! head -c 4 -- "$cand" 2>/dev/null | grep -q '#!/u' && { NODE_BIN="$cand"; break; }
-  done
-fi
-[ -n "$NODE_BIN" ] || NODE_BIN="$(command -v node || true)"
 
 usage() {
   cat >&2 <<'USAGE'
 usage: install-quietlsp [--uninstall] [--status]
 
 Wraps the TypeScript and rust-analyzer language servers so Claude Code's LSP
-feature only receives diagnostics for files inside a session's own cwd.
+feature only receives diagnostics for files inside a session's own cwd, via
+a PATH-shadowing shim in ~/.claude/bin (verified first on PATH in every
+sampled session — see README).
 
-  --status     report wrapped/drifted/unwrapped per discovered plugin version
-               dir (wrapped requires: recognized target, shim content matches
-               the repo, real server resolvable, shim launch probe succeeds);
-               exit 1 if any target is not `wrapped`
-  --uninstall  remove every shim recorded as installed by this tool (real
-               installs at /usr/local/bin and ~/.cargo/bin were never touched)
+  --status     report wrapped/unwrapped/drifted per target, exit 1 if any
+               target is not `wrapped`
+  --uninstall  remove the shims this installer created (the real installs at
+               /usr/local/bin and ~/.cargo/bin were never touched)
 USAGE
   exit "${1:-2}"
 }
@@ -73,26 +72,28 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$NODE_BIN" ]; then
-  echo "install-quietlsp: FATAL no node on PATH — quietlsp requires node" >&2
+  for cand in /usr/bin/node /usr/local/bin/node; do
+    [ -x "$cand" ] && ! head -c 4 -- "$cand" 2>/dev/null | grep -q '#!/u' && { NODE_BIN="$cand"; break; }
+  done
+fi
+[ -n "$NODE_BIN" ] || NODE_BIN="$(command -v node || true)"
+if [ -z "$NODE_BIN" ]; then
+  echo "install-quietlsp: FATAL no node found — quietlsp requires node" >&2
   exit 1
 fi
 [ -x "$QUIETLSP_BIN" ] || { echo "install-quietlsp: FATAL missing wrapper at $QUIETLSP_BIN" >&2; exit 1; }
+mkdir -p "$SHIM_DIR" || { echo "install-quietlsp: FATAL cannot create $SHIM_DIR" >&2; exit 1; }
 
-# name:plugin — plugin dir name under $CACHE_ROOT to scan for version dirs.
-TARGETS=(
-  "typescript-language-server:typescript-lsp"
-  "rust-analyzer:rust-analyzer-lsp"
-)
+TARGETS=(typescript-language-server rust-analyzer)
 
 # Resolves the real (non-quietlsp) absolute binary for a command name by
-# walking PATH and skipping any entry that is one of our own shim dirs.
+# walking PATH and skipping our own shim dir (else a rerun would shadow
+# itself and resolve to its own shim in an infinite loop).
 resolve_real() {
   local cmd=$1 entry cand
   IFS=':' read -ra parts <<<"$PATH"
   for entry in "${parts[@]}"; do
-    case "$entry" in
-      "$CACHE_ROOT"/*/*/bin) continue ;;  # never resolve through our own shim dirs
-    esac
+    [ "$entry" = "$SHIM_DIR" ] && continue
     cand="$entry/$cmd"
     if [ -x "$cand" ] && [ ! -d "$cand" ]; then
       readlink -f -- "$cand" 2>/dev/null || echo "$cand"
@@ -114,113 +115,55 @@ SHIM
 is_shim() { grep -qF "$MARKER_FAMILY" <(head -c 200 -- "$1" 2>/dev/null); }
 shim_is_current() { [ "$(cat -- "$1" 2>/dev/null)" = "$(shim_body "$2" "$3")" ]; }
 
-record_path() {
-  local dest=$1
-  printf '%s/%s.json' "$RECORDS_DIR" "$(printf '%s' "$dest" | sha256sum | cut -d' ' -f1)"
-}
+wrapped=0; refreshed=0; current=0; unwrapped=0; stale=0; restored=0; skipped=0
 
-# Launch probe (R9): the shim must actually spawn end-to-end. `--version` is
-# supported by both wrapped binaries and exits immediately, so this proves
-# node + quietlsp + the real binary all execute without spawning a lingering
-# process (never touches any already-running language-server session).
-launch_probe_ok() {
-  timeout 5 "$1" --version >/dev/null 2>&1
-}
-
-# --- Phase 1: discover + validate every target, write nothing yet (R8). ---
-# plan entries: "cmd|plugin|version_dir|dest|real"
-PLAN=()
-skipped=0
-for target in "${TARGETS[@]}"; do
-  cmd="${target%%:*}"; plugin="${target##*:}"
-  plugin_root="$CACHE_ROOT/$plugin"
-  [ -d "$plugin_root" ] || { echo "install-quietlsp: no $plugin cache dir — skipping $cmd" >&2; skipped=$((skipped+1)); continue; }
-
+for cmd in "${TARGETS[@]}"; do
+  dest="$SHIM_DIR/$cmd"
   real="$(resolve_real "$cmd" || true)"
   if [ -z "$real" ]; then
-    echo "install-quietlsp: WARN no real '$cmd' found on PATH outside our own shim dirs — skipping" >&2
+    echo "install-quietlsp: WARN no real '$cmd' found on PATH outside $SHIM_DIR — skipping" >&2
     skipped=$((skipped+1))
     continue
   fi
-  if is_shim "$real" 2>/dev/null; then
-    echo "install-quietlsp: FATAL nested wrapper: resolved real '$cmd' at $real is itself a quietlsp shim" >&2
-    exit 1
-  fi
 
-  found_version=0
-  for version_dir in "$plugin_root"/*/; do
-    [ -d "$version_dir" ] || continue
-    found_version=1
-    bin_dir="${version_dir%/}/bin"
-    dest="$bin_dir/$cmd"
-
-    if [ "$RUN_MODE" = install ] && [ -e "$dest" ] && ! is_shim "$dest"; then
-      echo "install-quietlsp: FATAL $dest exists and is not a quietlsp shim — refusing to overwrite (collision)" >&2
-      exit 1
-    fi
-    PLAN+=("$cmd|$plugin|$version_dir|$dest|$real")
-  done
-  [ "$found_version" -eq 1 ] || echo "install-quietlsp: no version dirs under $plugin_root — skipping $cmd" >&2
-done
-
-# --- Phase 2: act on the validated plan. ---
-wrapped=0; refreshed=0; current=0; unwrapped=0; stale=0; restored=0; probe_failed=0
-
-case "$RUN_MODE" in
-install)
-  mkdir -p "$RECORDS_DIR" || { echo "install-quietlsp: FATAL cannot create $RECORDS_DIR" >&2; exit 1; }
-  for entry in "${PLAN[@]}"; do
-    IFS='|' read -r cmd plugin version_dir dest real <<<"$entry"
-    bin_dir="$(dirname -- "$dest")"
-    mkdir -p "$bin_dir" || { echo "install-quietlsp: FATAL cannot create $bin_dir" >&2; exit 1; }
-    if [ -e "$dest" ] && shim_is_current "$dest" "$cmd" "$real"; then
-      current=$((current+1))
-    else
+  case "$RUN_MODE" in
+    install)
+      if [ -e "$dest" ] && ! is_shim "$dest"; then
+        echo "install-quietlsp: FATAL $dest exists and is not a quietlsp shim — refusing to overwrite" >&2
+        exit 1
+      fi
+      if [ -e "$dest" ] && shim_is_current "$dest" "$cmd" "$real"; then
+        current=$((current+1)); continue
+      fi
       tmp="$dest.quietlsp.$$"
       shim_body "$cmd" "$real" >"$tmp" || { rm -f -- "$tmp"; echo "install-quietlsp: FATAL cannot write $dest" >&2; exit 1; }
       chmod 755 "$tmp"
       if [ -e "$dest" ]; then refreshed=$((refreshed+1)); else wrapped=$((wrapped+1)); fi
       mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; echo "install-quietlsp: FATAL cannot install $dest" >&2; exit 1; }
-    fi
-    hash="$(sha256sum -- "$dest" | cut -d' ' -f1)"
-    mode="$(stat -c %a -- "$dest")"
-    jq -n --arg dest "$dest" --arg plugin "$plugin" --arg version_dir "${version_dir%/}" \
-      --arg cmd "$cmd" --arg real "$real" --arg node_bin "$NODE_BIN" \
-      --arg quietlsp_bin "$QUIETLSP_BIN" --arg sha256 "$hash" --arg mode "$mode" \
-      --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{dest:$dest, plugin:$plugin, version_dir:$version_dir, cmd:$cmd, real:$real, node_bin:$node_bin, quietlsp_bin:$quietlsp_bin, sha256:$sha256, mode:$mode, installed_at:$installed_at}' \
-      >"$(record_path "$dest")"
-  done
-  echo "install-quietlsp: wrapped=$wrapped refreshed=$refreshed current=$current skipped=$skipped"
-  ;;
-status)
-  for entry in "${PLAN[@]}"; do
-    IFS='|' read -r cmd plugin version_dir dest real <<<"$entry"
-    if [ ! -e "$dest" ]; then
-      unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest"
-    elif ! is_shim "$dest"; then
-      unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest (foreign file, not a quietlsp shim)"
-    elif ! shim_is_current "$dest" "$cmd" "$real"; then
-      stale=$((stale+1)); echo "DRIFTED $dest (shim content does not match this repo)"
-    elif ! launch_probe_ok "$dest"; then
-      stale=$((stale+1)); probe_failed=$((probe_failed+1)); echo "DRIFTED $dest (shim present but launch probe failed)"
-    else
-      wrapped=$((wrapped+1))
-    fi
-  done
-  echo "install-quietlsp: wrapped=$wrapped stale=$stale unwrapped=$unwrapped skipped=$skipped probe_failed=$probe_failed"
-  [ "$unwrapped" -eq 0 ] && [ "$stale" -eq 0 ] || exit 1
-  ;;
-uninstall)
-  shopt -s nullglob
-  for record in "$RECORDS_DIR"/*.json; do
-    dest="$(jq -r '.dest' -- "$record")"
-    if [ -e "$dest" ] && is_shim "$dest"; then
-      rm -f -- "$dest" && restored=$((restored+1))
-      rmdir -- "$(dirname -- "$dest")" 2>/dev/null || true
-    fi
-    rm -f -- "$record"
-  done
-  echo "install-quietlsp: restored=$restored"
-  ;;
+      ;;
+    status)
+      if [ ! -e "$dest" ]; then
+        unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest"
+      elif ! is_shim "$dest"; then
+        unwrapped=$((unwrapped+1)); echo "UNWRAPPED $dest (foreign file, not a quietlsp shim)"
+      elif shim_is_current "$dest" "$cmd" "$real"; then
+        wrapped=$((wrapped+1))
+      else
+        stale=$((stale+1)); echo "DRIFTED $dest"
+      fi
+      ;;
+    uninstall)
+      if [ -e "$dest" ] && is_shim "$dest"; then
+        rm -f -- "$dest" && restored=$((restored+1))
+      fi
+      ;;
+  esac
+done
+
+case "$RUN_MODE" in
+  install)   echo "install-quietlsp: wrapped=$wrapped refreshed=$refreshed current=$current skipped=$skipped ($SHIM_DIR)" ;;
+  uninstall) echo "install-quietlsp: restored=$restored ($SHIM_DIR)" ;;
+  status)
+    echo "install-quietlsp: wrapped=$wrapped stale=$stale unwrapped=$unwrapped skipped=$skipped ($SHIM_DIR)"
+    [ "$unwrapped" -eq 0 ] && [ "$stale" -eq 0 ] || exit 1 ;;
 esac
