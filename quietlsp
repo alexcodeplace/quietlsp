@@ -2,13 +2,17 @@
 // quietlsp — cwd-scoped LSP diagnostics filter.
 //
 // Sits between a Claude Code language-server plugin and the real language
-// server binary. Client->server bytes pass through untouched. Server->client
-// bytes are parsed as Content-Length-framed JSON-RPC (LSP); a
-// textDocument/publishDiagnostics notification whose uri resolves outside
-// this process's cwd subtree is dropped whole. Everything else passes
-// byte-identical. Any framing/parse error permanently switches the rest of
-// the stream to raw passthrough (a broken LSP is worse than noisy
-// diagnostics) and logs once to ~/.local/state/overdeck/quietlsp.log.
+// server binary. Server->client bytes are parsed as Content-Length-framed
+// JSON-RPC (LSP); a textDocument/publishDiagnostics notification whose uri
+// resolves outside this process's cwd subtree is dropped whole. Everything
+// else passes byte-identical. The ONE sanctioned client->server mutation:
+// the client's `initialize` request has `textDocument.diagnostic` stripped
+// from its advertised capabilities, forcing servers (rust-analyzer) into
+// push-diagnostics mode instead of pull — a publish-only filter does
+// nothing against pull-mode `textDocument/diagnostic` requests. Any framing
+// error permanently switches the rest of the stream to raw passthrough (a
+// broken LSP is worse than noisy diagnostics) and logs once to
+// ~/.local/state/overdeck/quietlsp.log.
 //
 // Usage: quietlsp <real-binary-absolute-path> [args...]
 
@@ -51,8 +55,15 @@ function main() {
     process.exitCode = 127;
   });
 
-  // client -> server: untouched, unbuffered.
-  process.stdin.pipe(child.stdin);
+  // client -> server: framed so the initialize capability rewrite (R1) can
+  // touch exactly one frame; every other frame is forwarded as original
+  // bytes, never JSON round-tripped.
+  const clientFilter = makeClientFilter(child.stdin);
+  process.stdin.on('data', (chunk) => clientFilter.push(chunk));
+  process.stdin.on('end', () => {
+    clientFilter.flush();
+    child.stdin.end();
+  });
 
   const filter = makeFilter(scopeRoot, () => {
     // Fail-open: from here on, raw passthrough for the rest of the stream.
@@ -83,6 +94,132 @@ function main() {
   });
 }
 
+// Splits exactly one Content-Length-framed message off the front of `buf`.
+// Returns null if more data is needed. Throws on framing corruption (bad or
+// missing Content-Length, header too long) — the caller treats that as
+// permanent fail-open, never a per-frame classification failure.
+function splitOneFrame(buf) {
+  const headerEnd = buf.indexOf('\r\n\r\n');
+  if (headerEnd === -1) {
+    if (buf.length > 64 * 1024) throw new Error('header exceeds 64KiB without terminator');
+    return null;
+  }
+  const headerText = buf.slice(0, headerEnd).toString('ascii');
+  const lenMatch = /Content-Length:\s*(\d+)/i.exec(headerText);
+  if (!lenMatch) throw new Error(`missing Content-Length in header: ${JSON.stringify(headerText)}`);
+  const contentLength = Number(lenMatch[1]);
+  if (!Number.isFinite(contentLength) || contentLength < 0) {
+    throw new Error(`invalid Content-Length: ${lenMatch[1]}`);
+  }
+  const bodyStart = headerEnd + 4;
+  const bodyEnd = bodyStart + contentLength;
+  if (buf.length < bodyEnd) return null;
+  return {
+    frame: buf.slice(0, bodyEnd), // header + body, exact original bytes
+    headerText,
+    body: buf.slice(bodyStart, bodyEnd),
+    rest: buf.slice(bodyEnd),
+  };
+}
+
+// Rebuilds a frame's header with only the Content-Length line changed,
+// preserving every other header line verbatim. `newBody` is the new body
+// Buffer; its byte length (not string .length) becomes Content-Length.
+function reframe(headerText, newBody) {
+  const lines = headerText.split('\r\n').filter(Boolean);
+  let sawLength = false;
+  const rewritten = lines.map((line) => {
+    if (/^Content-Length:/i.test(line)) {
+      sawLength = true;
+      return `Content-Length: ${newBody.length}`;
+    }
+    return line;
+  });
+  if (!sawLength) rewritten.push(`Content-Length: ${newBody.length}`);
+  return Buffer.concat([Buffer.from(rewritten.join('\r\n') + '\r\n\r\n', 'ascii'), newBody]);
+}
+
+// Given a parsed `initialize` request body, strips capabilities.textDocument
+// .diagnostic (pull-diagnostics support) so every server negotiates push
+// mode. Returns the rewritten body Buffer, or null if nothing to change
+// (message wasn't `initialize`, or it never advertised pull diagnostics).
+// `onRewrite(originalJson, rewrittenJson)` fires at most once per call site
+// that wants the one-per-session log line; callers that don't care omit it.
+function rewriteInitializeCapabilities(msg, onRewrite) {
+  if (!msg || msg.method !== 'initialize') return null;
+  const params = msg.params;
+  const textDocument = params && params.capabilities && params.capabilities.textDocument;
+  if (!textDocument || !Object.prototype.hasOwnProperty.call(textDocument, 'diagnostic')) {
+    return null;
+  }
+  const original = JSON.stringify(textDocument);
+  delete textDocument.diagnostic;
+  const rewritten = JSON.stringify(textDocument);
+  if (onRewrite) onRewrite(original, rewritten);
+  return Buffer.from(JSON.stringify(msg), 'utf8');
+}
+
+// client -> server: passthrough for every frame except `initialize`, whose
+// body is JSON-parsed, has textDocument.diagnostic stripped, and is
+// re-emitted with Content-Length recomputed for that frame only.
+function makeClientFilter(childStdin) {
+  let buf = Buffer.alloc(0);
+  let failedOpen = false;
+  let capabilityRewriteLogged = false;
+
+  function push(chunk) {
+    if (failedOpen) {
+      childStdin.write(chunk);
+      return;
+    }
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    try {
+      drain();
+    } catch (err) {
+      failOpen(err);
+    }
+  }
+
+  function failOpen(err) {
+    if (failedOpen) return;
+    failedOpen = true;
+    logOnce(`client framing error, switching to passthrough: ${err && err.message}`);
+    if (buf.length) childStdin.write(buf);
+    buf = Buffer.alloc(0);
+  }
+
+  function drain() {
+    for (;;) {
+      const parsed = splitOneFrame(buf);
+      if (!parsed) return;
+      buf = parsed.rest;
+
+      let outFrame = parsed.frame;
+      try {
+        const msg = JSON.parse(parsed.body.toString('utf8'));
+        const rewrittenBody = rewriteInitializeCapabilities(msg, (original, rewritten) => {
+          if (capabilityRewriteLogged) return;
+          capabilityRewriteLogged = true;
+          logOnce(`capability rewrite: original textDocument=${original} rewritten textDocument=${rewritten}`);
+        });
+        if (rewrittenBody) outFrame = reframe(parsed.headerText, rewrittenBody);
+      } catch {
+        // Not parseable JSON or not `initialize`: forward the original
+        // frame bytes unchanged. Frame boundaries are still trustworthy.
+      }
+      childStdin.write(outFrame);
+    }
+  }
+
+  function flush() {
+    if (failedOpen) return;
+    if (buf.length) childStdin.write(buf); // incomplete trailing frame: emit raw rather than lose it
+    buf = Buffer.alloc(0);
+  }
+
+  return { push, flush };
+}
+
 // Returns { push(chunk) }. On any framing error, calls onFailOpen() once and
 // stops parsing (caller re-pipes raw bytes directly).
 function makeFilter(scopeRoot, onFailOpen) {
@@ -109,30 +246,14 @@ function makeFilter(scopeRoot, onFailOpen) {
 
   function drain() {
     for (;;) {
-      const headerEnd = buf.indexOf('\r\n\r\n');
-      if (headerEnd === -1) {
-        if (buf.length > 64 * 1024) throw new Error('header exceeds 64KiB without terminator');
-        return; // need more data
-      }
-      const headerText = buf.slice(0, headerEnd).toString('ascii');
-      const lenMatch = /Content-Length:\s*(\d+)/i.exec(headerText);
-      if (!lenMatch) throw new Error(`missing Content-Length in header: ${JSON.stringify(headerText)}`);
-      const contentLength = Number(lenMatch[1]);
-      if (!Number.isFinite(contentLength) || contentLength < 0) {
-        throw new Error(`invalid Content-Length: ${lenMatch[1]}`);
-      }
-      const bodyStart = headerEnd + 4;
-      const bodyEnd = bodyStart + contentLength;
-      if (buf.length < bodyEnd) return; // need more data
+      const parsed = splitOneFrame(buf);
+      if (!parsed) return;
+      buf = parsed.rest;
 
-      const frame = buf.slice(0, bodyEnd); // header + body, exact original bytes
-      const body = buf.slice(bodyStart, bodyEnd);
-      buf = buf.slice(bodyEnd);
-
-      if (shouldDrop(body)) {
+      if (shouldDrop(parsed.body)) {
         // dropped whole: nothing written
       } else {
-        process.stdout.write(frame);
+        process.stdout.write(parsed.frame);
       }
     }
   }
@@ -142,7 +263,7 @@ function makeFilter(scopeRoot, onFailOpen) {
     try {
       msg = JSON.parse(bodyBuf.toString('utf8'));
     } catch {
-      throw new Error('body is not valid JSON');
+      return false; // per-frame parse failure: pass through, don't classify
     }
     if (msg.method !== 'textDocument/publishDiagnostics') return false;
     const uri = msg.params && msg.params.uri;
@@ -174,4 +295,4 @@ function makeFilter(scopeRoot, onFailOpen) {
 
 if (require.main === module) main();
 
-module.exports = { makeFilter };
+module.exports = { makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities };

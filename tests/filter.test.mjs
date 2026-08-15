@@ -144,6 +144,42 @@ test('large message split across chunk boundaries reassembles correctly', () => 
   assert.equal(got[0].params.diagnostics[0].message.length, 200_000);
 });
 
+test('initialize capability rewrite strips textDocument.diagnostic and recomputes Content-Length', () => {
+  const init = {
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { capabilities: { textDocument: { diagnostic: { dynamicRegistration: true }, hover: {} } } },
+  };
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [], stdinData: frame(init) });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  const echoed = res.stderr.toString('utf8').replace(/^ECHO:/, '');
+  const headerEnd = echoed.indexOf('\r\n\r\n');
+  const headerText = echoed.slice(0, headerEnd);
+  const len = Number(/Content-Length:\s*(\d+)/i.exec(headerText)[1]);
+  const body = Buffer.from(echoed.slice(headerEnd + 4), 'utf8').slice(0, len);
+  assert.equal(len, body.length);
+  const rewritten = JSON.parse(body.toString('utf8'));
+  assert.equal('diagnostic' in rewritten.params.capabilities.textDocument, false);
+  assert.deepEqual(rewritten.params.capabilities.textDocument.hover, {});
+  assert.equal(rewritten.id, 1);
+});
+
+test('initialize without pull-diagnostics capability passes unchanged', () => {
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { capabilities: { textDocument: { hover: {} } } } };
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [], stdinData: frame(init) });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  const echoed = res.stderr.toString('utf8').replace(/^ECHO:/, '');
+  assert.deepEqual(parseFrames(Buffer.from(echoed, 'utf8')), [init]);
+});
+
+test('non-initialize client requests pass through as original bytes, not round-tripped', () => {
+  const req = { jsonrpc: '2.0', id: 2, method: 'textDocument/hover', params: { z: 1, a: 2 } };
+  const raw = frame(req);
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [], stdinData: raw });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  const echoed = res.stderr.toString('utf8').replace(/^ECHO:/, '');
+  assert.equal(echoed, raw.toString('utf8'));
+});
+
 fs.rmSync(tmpRoot, { recursive: true, force: true });
 fs.rmSync(outTree, { force: true });
 
