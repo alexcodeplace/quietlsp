@@ -100,10 +100,21 @@ function main() {
 
   const child = spawn(realBin, realArgs, { stdio: ['pipe', 'pipe', 'inherit'] });
 
+  let spawnFailed = false;
   child.on('error', (err) => {
+    spawnFailed = true;
     logOnce(`FATAL spawn ${realBin}: ${err.message}`);
     process.exitCode = 127;
   });
+
+  // A write after the peer has already gone away (child exited/crashed
+  // mid-frame, or the client end of our own stdout pipe closed) emits
+  // 'error' on that stream; without a listener Node throws and the process
+  // dies with a stack trace instead of the exit code exitCodeFor computes.
+  // The per-write callback (inside makeOrderedWriter) still fires on error,
+  // so pending-write accounting for the drain-before-exit logic is unaffected.
+  child.stdin.on('error', (err) => logOnce(`child stdin write error (peer gone): ${err.message}`));
+  process.stdout.on('error', (err) => logOnce(`stdout write error (peer gone): ${err.message}`));
 
   // Single ordered writer per direction (R11): every server->client byte,
   // filtered or fail-open passthrough, funnels through one writer so exit
@@ -152,7 +163,7 @@ function main() {
   // streams to finish, so by the time this fires filter.flush() has already
   // been called via the 'end' listener above and every write is queued.
   child.on('close', (code, signal) => {
-    const exitCode = exitCodeFor(code, signal);
+    const exitCode = spawnFailed ? 127 : exitCodeFor(code, signal);
     // Hard deadline (R11): if stdout hasn't drained in 5s (a wedged pipe,
     // e.g. a dead reader on the other end), force exit rather than hang the
     // session forever. unref() so a clean, fast drain never keeps the

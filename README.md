@@ -43,25 +43,40 @@ part of the contract (see `2.0.6`+`2.0.7` precedent for `security-guidance`).
 ## Files
 
 - `quietlsp` — the wrapper. `quietlsp <real-binary-absolute-path> [args...]`.
-  Spawns the real binary, relays client→server bytes untouched, parses
-  server→client bytes as Content-Length-framed JSON-RPC and drops
-  `textDocument/publishDiagnostics` notifications whose `uri` resolves
-  outside the wrapper's own `cwd`. Any framing/parse error → permanent raw
-  passthrough for the rest of the stream (a broken LSP is worse than noisy
-  diagnostics) + one log line to `~/.local/state/overdeck/quietlsp.log`.
+  Spawns the real binary. Client→server bytes pass through as original
+  frame bytes except the client's `initialize` request, which has
+  `capabilities.textDocument.diagnostic` stripped (forces push-mode
+  diagnostics; Content-Length recomputed for that one frame). Server→client
+  bytes are parsed as Content-Length-framed JSON-RPC; a
+  `textDocument/publishDiagnostics` whose `file:` `uri` resolves outside the
+  session's cwd (or a validated `workspaceFolders` root) is dropped, except
+  an already-empty clear for a previously-forwarded uri, which passes once.
+  A framing error → permanent raw passthrough for the rest of the stream; an
+  unparseable single frame → that frame passes, filtering resumes at the
+  next. One log line each for the capability rewrite, any `rootUri`/cwd
+  disagreement, and any framing error, to
+  `~/.local/state/overdeck/quietlsp.log`.
 - `install-quietlsp` — idempotent installer. Discovers every version dir
   under the `typescript-lsp` and `rust-analyzer-lsp` plugin caches, resolves
-  each command's real binary (skipping its own shim dirs during the search),
-  and writes/refreshes a shim in `<version-dir>/bin/`.
+  each command's real binary (skipping its own shim dirs during the
+  search), validates every target before writing any of them, and
+  writes/refreshes a shim in `<version-dir>/bin/`. Every successful install
+  is recorded (dest, real binary, hash, mode, timestamp) under
+  `~/.local/state/quietlsp/installs/`.
   - `install-quietlsp` — install/repair.
   - `install-quietlsp --status` — per-target `wrapped` / `UNWRAPPED` /
-    `DRIFTED`; exits non-zero unless everything is `wrapped`.
-  - `install-quietlsp --uninstall` — removes shims, restores nothing else
-    (the real installs at `/usr/local/bin` and `~/.cargo/bin` were never
-    touched).
+    `DRIFTED` (content mismatch OR a failed launch probe); exits non-zero
+    unless everything is `wrapped`.
+  - `install-quietlsp --uninstall` — removes only shims this tool recorded
+    installing, and clears those records (the real installs at
+    `/usr/local/bin` and `~/.cargo/bin` were never touched).
 - `tests/filter.test.mjs` — framed-stream fixture tests for the wrapper.
 - `tests/installer.test.sh` — installer idempotency and `--status` verdict
   tests, run entirely inside a throwaway sandbox.
+- `tests/integration.test.mjs` — drives a real session against the installed
+  `typescript-language-server`; skips itself (loudly) if that binary isn't
+  present, and reports a named gap if only a non-functional `rustup` proxy
+  stub exists for `rust-analyzer`.
 
 ## Re-run after a plugin version bump
 
@@ -74,6 +89,7 @@ finds, old and new, and leaves already-current shims untouched.
 ```
 /usr/bin/node tests/filter.test.mjs
 bash tests/installer.test.sh
+/usr/bin/node tests/integration.test.mjs
 ```
 
 (Use the real `/usr/bin/node`, not a PATH shim that redirects builds to a

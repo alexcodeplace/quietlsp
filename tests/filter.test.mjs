@@ -2,7 +2,7 @@
 // Run: node tests/filter.test.mjs
 'use strict';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -340,6 +340,40 @@ test('R5 end-to-end: a diagnostic for a workspaceFolder outside cwd is forwarded
   assert.equal(res.status, 0, res.stderr?.toString());
   assert.deepEqual(parseFrames(res.stdout), [diag]);
   fs.rmSync(extraDir, { recursive: true, force: true });
+});
+
+test('R11: bad real binary path still exits 127, not the close-handler default', () => {
+  const res = spawnSync(process.execPath, [QUIETLSP, '/nonexistent/not-a-real-binary'], { cwd: tmpRoot, input: 'x', encoding: null });
+  assert.equal(res.status, 127);
+});
+
+await new Promise((resolve) => {
+  // Server reads exactly one frame then SIGKILLs itself; the driver keeps
+  // writing frames afterward — exercises writing to a stdin whose reader is
+  // already gone, in the direction the earlier signal-death test does not.
+  const scriptPath = path.join(os.tmpdir(), `quietlsp-diesearly-server-${process.pid}.mjs`);
+  fs.writeFileSync(scriptPath, [
+    "let seen = false;",
+    "process.stdin.on('data', () => {",
+    "  if (!seen) { seen = true; process.kill(process.pid, 'SIGKILL'); }",
+    '});',
+  ].join('\n'));
+
+  const child = spawn(QUIETLSP, [process.execPath, scriptPath], { cwd: tmpRoot });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  const iv = setInterval(() => {
+    try { child.stdin.write(frame({ jsonrpc: '2.0', method: 'x', params: {} })); } catch { /* covered by wrapper's own error handling */ }
+  }, 40);
+  child.on('close', () => {
+    clearInterval(iv);
+    fs.unlinkSync(scriptPath);
+    test('R11: writing to a peer that died mid-session does not crash the wrapper (EPIPE handled)', () => {
+      assert.ok(!/ERR_STREAM_DESTROYED|EPIPE|Unhandled/i.test(stderr), `wrapper crashed instead of exiting cleanly:\n${stderr}`);
+    });
+    resolve();
+  });
+  setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 5000);
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });
