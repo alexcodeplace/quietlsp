@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
-const { decideForward } = await import(pathToFileURL(QUIETLSP).href);
+const { decideForward, exitCodeFor } = await import(pathToFileURL(QUIETLSP).href);
 
 function frame(obj) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -209,6 +209,51 @@ test('out-of-tree clear passes once after an in-tree publication, then drops aga
   assert.equal(res.status, 0, res.stderr?.toString());
   // Never forwarded (root never included outTree), so both are dropped.
   assert.deepEqual(parseFrames(res.stdout), []);
+});
+
+test('exitCodeFor maps normal exit and signal death (R11)', () => {
+  assert.equal(exitCodeFor(0, null), 0);
+  assert.equal(exitCodeFor(3, null), 3);
+  assert.equal(exitCodeFor(null, 'SIGTERM'), 128 + 15);
+  assert.equal(exitCodeFor(null, 'SIGKILL'), 128 + 9);
+});
+
+test('R7 split: valid frame with unparseable body passes that frame, resumes filtering next frame', () => {
+  const scriptPath = path.join(os.tmpdir(), `quietlsp-badjson-server-${process.pid}.mjs`);
+  const goodDiag = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(inTree), diagnostics: [] } };
+  fs.writeFileSync(scriptPath, `
+    process.stdin.on('data', () => {});
+    process.stdin.on('end', () => {
+      const bad = Buffer.from('not json at all', 'utf8');
+      process.stdout.write('Content-Length: ' + bad.length + '\\r\\n\\r\\n');
+      process.stdout.write(bad);
+      const goodBody = Buffer.from(${JSON.stringify(JSON.stringify(goodDiag))}, 'utf8');
+      process.stdout.write('Content-Length: ' + goodBody.length + '\\r\\n\\r\\n');
+      process.stdout.write(goodBody);
+      process.stdout.end(() => process.exit(0));
+    });
+  `);
+  const res = spawnSync(process.execPath, [QUIETLSP, process.execPath, scriptPath], { cwd: tmpRoot, input: 'x', encoding: null });
+  fs.unlinkSync(scriptPath);
+  assert.equal(res.status, 0, res.stderr?.toString());
+  const asString = res.stdout.toString('utf8');
+  const expectedBad = `Content-Length: ${Buffer.byteLength('not json at all', 'utf8')}\r\n\r\nnot json at all`;
+  assert.ok(asString.startsWith(expectedBad), 'unparseable-but-well-framed body passes unchanged');
+  // Framing stayed trustworthy: the following well-formed diagnostic still parses (not raw-passthrough-forever).
+  const rest = asString.slice(expectedBad.length);
+  const parsed = parseFrames(Buffer.from(rest, 'utf8'));
+  assert.deepEqual(parsed, [goodDiag]);
+});
+
+test('R11: process exits with 128+signal on child death by signal', () => {
+  const scriptPath = path.join(os.tmpdir(), `quietlsp-selfkill-server-${process.pid}.mjs`);
+  fs.writeFileSync(scriptPath, `
+    process.stdin.on('data', () => {});
+    process.stdin.on('end', () => process.kill(process.pid, 'SIGKILL'));
+  `);
+  const res = spawnSync(process.execPath, [QUIETLSP, process.execPath, scriptPath], { cwd: tmpRoot, input: 'x', encoding: null });
+  fs.unlinkSync(scriptPath);
+  assert.equal(res.status, 128 + 9);
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });

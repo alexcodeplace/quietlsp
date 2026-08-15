@@ -34,6 +34,56 @@ function logOnce(msg) {
   }
 }
 
+// Single ordered writer for one direction of the pipe. Writes are issued to
+// the underlying stream in call order (JS is single-threaded, so ordering is
+// never at risk); what this adds is COMPLETION tracking, so callers can know
+// every write has actually been accepted by the OS before the process exits
+// — `process.exit()` does not wait for pending stream writes and will
+// truncate the last frames of a fast-exiting child's output.
+function makeOrderedWriter(stream) {
+  let pending = 0;
+  let finished = false;
+  let onIdle = null;
+
+  function write(buf) {
+    if (!buf || !buf.length) return;
+    pending += 1;
+    stream.write(buf, () => {
+      pending -= 1;
+      checkIdle();
+    });
+  }
+
+  function checkIdle() {
+    if (finished && pending === 0 && onIdle) {
+      const cb = onIdle;
+      onIdle = null;
+      cb();
+    }
+  }
+
+  // Calls `cb` once every write() issued so far has been accepted by the
+  // stream. No further writes are expected after this is called.
+  function whenDrained(cb) {
+    finished = true;
+    onIdle = cb;
+    checkIdle();
+  }
+
+  return { write, whenDrained };
+}
+
+// Maps a child's exit disposition to the wrapper's own exit code, per the
+// shell convention the calling harness expects: a normal exit forwards the
+// code; death by signal N reports 128+N.
+function exitCodeFor(code, signal) {
+  if (signal) {
+    const n = os.constants.signals[signal];
+    return n ? 128 + n : 1;
+  }
+  return code ?? 0;
+}
+
 function main() {
   const [realBin, ...realArgs] = process.argv.slice(2);
   if (!realBin) {
@@ -55,21 +105,23 @@ function main() {
     process.exitCode = 127;
   });
 
+  // Single ordered writer per direction (R11): every server->client byte,
+  // filtered or fail-open passthrough, funnels through one writer so exit
+  // can wait for it to actually drain instead of racing process.exit().
+  const stdinWriter = makeOrderedWriter(child.stdin);
+  const stdoutWriter = makeOrderedWriter(process.stdout);
+
   // client -> server: framed so the initialize capability rewrite (R1) can
   // touch exactly one frame; every other frame is forwarded as original
   // bytes, never JSON round-tripped.
-  const clientFilter = makeClientFilter(child.stdin);
+  const clientFilter = makeClientFilter(stdinWriter);
   process.stdin.on('data', (chunk) => clientFilter.push(chunk));
   process.stdin.on('end', () => {
     clientFilter.flush();
-    child.stdin.end();
+    child.stdin.end(); // client EOF -> close child stdin (R11)
   });
 
-  const filter = makeFilter(scopeRoot, () => {
-    // Fail-open: from here on, raw passthrough for the rest of the stream.
-    child.stdout.unpipe();
-    child.stdout.pipe(process.stdout);
-  });
+  const filter = makeFilter(scopeRoot, stdoutWriter);
   child.stdout.on('data', (chunk) => filter.push(chunk));
   // A well-formed LSP stream never ends mid-frame, but if the child exits
   // abruptly (crash/kill) any incomplete trailing bytes must still reach the
@@ -84,13 +136,20 @@ function main() {
   // 'close', not 'exit': 'exit' fires as soon as the child process terminates,
   // but buffered stdout data can still be delivered as 'data' events after
   // that — exiting on 'exit' truncates output. 'close' waits for all stdio
-  // streams to finish.
+  // streams to finish, so by the time this fires filter.flush() has already
+  // been called via the 'end' listener above and every write is queued.
   child.on('close', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-      return;
-    }
-    process.exit(code ?? 0);
+    const exitCode = exitCodeFor(code, signal);
+    // Hard deadline (R11): if stdout hasn't drained in 5s (a wedged pipe,
+    // e.g. a dead reader on the other end), force exit rather than hang the
+    // session forever. unref() so a clean, fast drain never keeps the
+    // process alive waiting on this timer.
+    const deadline = setTimeout(() => process.exit(exitCode), 5000);
+    deadline.unref();
+    stdoutWriter.whenDrained(() => {
+      clearTimeout(deadline);
+      process.exit(exitCode);
+    });
   });
 }
 
@@ -162,14 +221,14 @@ function rewriteInitializeCapabilities(msg, onRewrite) {
 // client -> server: passthrough for every frame except `initialize`, whose
 // body is JSON-parsed, has textDocument.diagnostic stripped, and is
 // re-emitted with Content-Length recomputed for that frame only.
-function makeClientFilter(childStdin) {
+function makeClientFilter(stdinWriter) {
   let buf = Buffer.alloc(0);
   let failedOpen = false;
   let capabilityRewriteLogged = false;
 
   function push(chunk) {
     if (failedOpen) {
-      childStdin.write(chunk);
+      stdinWriter.write(chunk);
       return;
     }
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
@@ -184,7 +243,7 @@ function makeClientFilter(childStdin) {
     if (failedOpen) return;
     failedOpen = true;
     logOnce(`client framing error, switching to passthrough: ${err && err.message}`);
-    if (buf.length) childStdin.write(buf);
+    if (buf.length) stdinWriter.write(buf);
     buf = Buffer.alloc(0);
   }
 
@@ -207,21 +266,19 @@ function makeClientFilter(childStdin) {
         // Not parseable JSON or not `initialize`: forward the original
         // frame bytes unchanged. Frame boundaries are still trustworthy.
       }
-      childStdin.write(outFrame);
+      stdinWriter.write(outFrame);
     }
   }
 
   function flush() {
     if (failedOpen) return;
-    if (buf.length) childStdin.write(buf); // incomplete trailing frame: emit raw rather than lose it
+    if (buf.length) stdinWriter.write(buf); // incomplete trailing frame: emit raw rather than lose it
     buf = Buffer.alloc(0);
   }
 
   return { push, flush };
 }
 
-// Returns { push(chunk) }. On any framing error, calls onFailOpen() once and
-// stops parsing (caller re-pipes raw bytes directly).
 // Pure decision function, injectable for unit testing without filesystem
 // gymnastics: given a parsed message, the running forwardedUris Set (mutated
 // in place — same lifetime as the filter), and a classify(uri) function
@@ -248,27 +305,37 @@ function decideForward(msg, forwardedUris, classify) {
   return false;
 }
 
-function makeFilter(scopeRoot, onFailOpen) {
+// Returns { push(chunk), flush() }. On framing loss (bad/missing
+// Content-Length, damaged header) permanently switches to raw byte
+// passthrough for the rest of the stream — frame boundaries are no longer
+// trustworthy, so parsing stops for good. A single unparseable/unclassifiable
+// FRAME is a different failure (handled inside shouldForward): that frame is
+// passed through and parsing resumes at the next frame, because boundaries
+// are still known-good.
+function makeFilter(scopeRoot, writer) {
   let buf = Buffer.alloc(0);
   let failedOpen = false;
   const forwardedUris = new Set();
 
   function push(chunk) {
-    if (failedOpen) return; // caller has re-piped; nothing left to do here
+    if (failedOpen) {
+      writer.write(chunk);
+      return;
+    }
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
     try {
       drain();
     } catch (err) {
-      failOpen(err, buf);
+      failOpen(err);
     }
   }
 
-  function failOpen(err, remainder) {
+  function failOpen(err) {
     if (failedOpen) return;
     failedOpen = true;
     logOnce(`framing error, switching to passthrough: ${err && err.message}`);
-    if (remainder && remainder.length) process.stdout.write(remainder);
-    onFailOpen();
+    if (buf.length) writer.write(buf);
+    buf = Buffer.alloc(0);
   }
 
   function drain() {
@@ -278,7 +345,7 @@ function makeFilter(scopeRoot, onFailOpen) {
       buf = parsed.rest;
 
       if (shouldForward(parsed.body)) {
-        process.stdout.write(parsed.frame);
+        writer.write(parsed.frame);
       }
       // else: dropped whole, nothing written
     }
@@ -313,7 +380,7 @@ function makeFilter(scopeRoot, onFailOpen) {
 
   function flush() {
     if (failedOpen) return;
-    if (buf.length) process.stdout.write(buf); // incomplete trailing frame: emit raw rather than lose it
+    if (buf.length) writer.write(buf); // incomplete trailing frame: emit raw rather than lose it
     buf = Buffer.alloc(0);
   }
 
@@ -322,4 +389,7 @@ function makeFilter(scopeRoot, onFailOpen) {
 
 if (require.main === module) main();
 
-module.exports = { makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities, decideForward };
+module.exports = {
+  makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities,
+  decideForward, makeOrderedWriter, exitCodeFor,
+};
