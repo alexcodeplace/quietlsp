@@ -279,6 +279,69 @@ function makeClientFilter(stdinWriter) {
   return { push, flush };
 }
 
+// Resolves `p` to its canonical (symlink-free) form using the deepest
+// EXISTING ancestor: if `p` itself doesn't exist yet (e.g. a diagnostic for
+// a file the server hasn't flushed to disk), walk up until an ancestor
+// resolves, then rejoin the non-existent suffix onto that ancestor's real
+// path. Falls back to `p` unchanged if nothing up to the filesystem root
+// resolves (should not happen in practice).
+function canonicalizeBestEffort(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    // fall through to ancestor walk
+  }
+  const suffix = [];
+  let dir = path.dirname(p);
+  suffix.push(path.basename(p));
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(dir), ...suffix.reverse());
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return p; // reached the fs root without resolving anything
+      suffix.push(path.basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+// Component-based containment: true iff `real` is `root` itself or lives
+// under it. Never a naive string-prefix check (which would wrongly match
+// "/foo" against "/foobar") — path.relative() only ever emits a leading
+// ".." at a real path-component boundary.
+function isWithinRoot(root, real) {
+  const rel = path.relative(root, real);
+  if (rel === '') return true;
+  if (rel === '..' || rel.startsWith('..' + path.sep)) return false;
+  if (path.isAbsolute(rel)) return false; // different drive/root entirely
+  return true;
+}
+
+// R4: eligible for filtering is `file:` URIs only. Percent-decoding and
+// authority handling are delegated to the platform URL/fileURLToPath
+// parsers rather than hand-rolled. Anything that fails to parse as a URL,
+// isn't the `file:` scheme, or fails fileURLToPath (e.g. a non-localhost
+// authority) is classified `null` (not out of scope) — never drop what
+// can't be definitively resolved to a local file path.
+function classifyFileUri(uri, roots) {
+  let url;
+  try {
+    url = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'file:') return false;
+  let filePath;
+  try {
+    filePath = fileURLToPath(url);
+  } catch {
+    return false;
+  }
+  const real = canonicalizeBestEffort(filePath);
+  return !roots.some((root) => isWithinRoot(root, real));
+}
+
 // Pure decision function, injectable for unit testing without filesystem
 // gymnastics: given a parsed message, the running forwardedUris Set (mutated
 // in place — same lifetime as the filter), and a classify(uri) function
@@ -358,24 +421,7 @@ function makeFilter(scopeRoot, writer) {
     } catch {
       return true; // per-frame parse failure: pass through, don't classify
     }
-    return decideForward(msg, forwardedUris, isOutOfScope);
-  }
-
-  function isOutOfScope(uri) {
-    let filePath;
-    try {
-      filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
-    } catch {
-      return false; // not a resolvable file uri: never drop what we can't classify
-    }
-    let real;
-    try {
-      real = fs.realpathSync(filePath);
-    } catch {
-      real = path.resolve(filePath); // file may not exist on disk yet (rare); best effort
-    }
-    const rel = path.relative(scopeRoot, real);
-    return rel === '' ? false : rel.startsWith('..') || path.isAbsolute(rel);
+    return decideForward(msg, forwardedUris, (uri) => classifyFileUri(uri, [scopeRoot]));
   }
 
   function flush() {
@@ -391,5 +437,5 @@ if (require.main === module) main();
 
 module.exports = {
   makeFilter, makeClientFilter, splitOneFrame, reframe, rewriteInitializeCapabilities,
-  decideForward, makeOrderedWriter, exitCodeFor,
+  decideForward, makeOrderedWriter, exitCodeFor, canonicalizeBestEffort, isWithinRoot, classifyFileUri,
 };

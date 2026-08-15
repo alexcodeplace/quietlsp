@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
-const { decideForward, exitCodeFor } = await import(pathToFileURL(QUIETLSP).href);
+const { decideForward, exitCodeFor, canonicalizeBestEffort, isWithinRoot, classifyFileUri } = await import(pathToFileURL(QUIETLSP).href);
 
 function frame(obj) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -254,6 +254,47 @@ test('R11: process exits with 128+signal on child death by signal', () => {
   const res = spawnSync(process.execPath, [QUIETLSP, process.execPath, scriptPath], { cwd: tmpRoot, input: 'x', encoding: null });
   fs.unlinkSync(scriptPath);
   assert.equal(res.status, 128 + 9);
+});
+
+test('R4: non-file schemes (untitled:, git:, remote-ssh) always pass, never classified', () => {
+  for (const uri of ['untitled:Untitled-1', 'git:/repo/file.ts?ref=HEAD', 'vscode-remote://ssh-remote+box/x.ts']) {
+    assert.equal(classifyFileUri(uri, [tmpRoot]), false, uri);
+  }
+});
+
+test('R4: unparseable uri string is never classified as out of scope', () => {
+  assert.equal(classifyFileUri('not a uri at all', [tmpRoot]), false);
+});
+
+test('R4: percent-encoded file uri decodes before containment check', () => {
+  const dirWithSpace = path.join(tmpRoot, 'has space');
+  fs.mkdirSync(dirWithSpace, { recursive: true });
+  const f = path.join(dirWithSpace, 'x.ts');
+  fs.writeFileSync(f, '');
+  assert.equal(classifyFileUri(uriFor(f), [tmpRoot]), false, 'in scope, percent-decoded path resolves inside root');
+});
+
+test('R4: isWithinRoot is component-based, not a naive string prefix', () => {
+  assert.equal(isWithinRoot('/a/b', '/a/bcarry/x'), false, '"/a/bcarry" must not match root "/a/b"');
+  assert.equal(isWithinRoot('/a/b', '/a/b/c'), true);
+  assert.equal(isWithinRoot('/a/b', '/a/b'), true);
+});
+
+test('R4: canonicalizeBestEffort resolves through the deepest existing ancestor', () => {
+  const real = canonicalizeBestEffort(path.join(tmpRoot, 'nope', 'deeper', 'missing.ts'));
+  assert.equal(real, path.join(fs.realpathSync(tmpRoot), 'nope', 'deeper', 'missing.ts'));
+});
+
+test('R4: a symlinked directory is resolved before containment check (out-of-tree via symlink dropped)', () => {
+  const realOutside = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-real-outside-'));
+  const linkPath = path.join(tmpRoot, 'link-to-outside');
+  fs.symlinkSync(realOutside, linkPath);
+  const f = path.join(linkPath, 'y.ts'); // never created on disk; exercises ancestor-walk canonicalization
+  const diag = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(f), diagnostics: [] } };
+  const res = runQuietlsp({ cwd: tmpRoot, messages: [diag] });
+  assert.equal(res.status, 0, res.stderr?.toString());
+  assert.deepEqual(parseFrames(res.stdout), []);
+  fs.rmSync(realOutside, { recursive: true, force: true });
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });
