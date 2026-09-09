@@ -12,7 +12,7 @@
 // nothing against pull-mode `textDocument/diagnostic` requests. Any framing
 // error permanently switches the rest of the stream to raw passthrough (a
 // broken LSP is worse than noisy diagnostics) and logs once to
-// ~/.local/state/overdeck/quietlsp.log.
+// ${XDG_STATE_HOME:-~/.local/state}/quietlsp/quietlsp.log (or QUIETLSP_LOG).
 //
 // Usage: quietlsp <real-binary-absolute-path> [args...]
 
@@ -23,7 +23,8 @@ const path = require('node:path');
 const os = require('node:os');
 const { fileURLToPath } = require('node:url');
 
-const LOG_PATH = path.join(os.homedir(), '.local/state/overdeck/quietlsp.log');
+const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+const LOG_PATH = process.env.QUIETLSP_LOG || path.join(STATE_HOME, 'quietlsp', 'quietlsp.log');
 
 function logOnce(msg) {
   try {

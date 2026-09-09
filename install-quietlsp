@@ -1,40 +1,16 @@
 #!/usr/bin/env bash
-# install-quietlsp — wrap the TypeScript and rust-analyzer language servers so
-# Claude Code's LSP feature only ever receives diagnostics for files inside
-# the session's own cwd subtree.
+# install-quietlsp — install PATH-shadowing wrappers for Claude Code language servers.
 #
-# ATTACH POINT (corrected 2026-08-15, replaces an earlier wrong claim — see
-# README "Attach mechanism" for the full story): NOT a Claude-Code-constructed
-# per-LSP-spawn PATH prepend into the plugin cache version dir. Direct
-# /proc/<pid>/environ inspection of live typescript-language-server processes
-# showed that PATH entry present in only 1 of 3 running instances (a resumed
-# session whose shell had it via unrelated PATH accretion) and ABSENT from
-# the other 2, including one spawned after this installer had already run.
-# Not reliable — do not use it.
+# Claude Code currently resolves typescript-language-server and rust-analyzer by
+# command name. QuietLSP shadows those names in QUIETLSP_SHIM_DIR (default
+# $HOME/.claude/bin), then launches the real binary found later on PATH.
 #
-# What IS reliable, confirmed across every sampled process (including the
-# two that spawn /usr/local/bin/typescript-language-server directly with no
-# shim in the chain) and in a fresh login shell: $HOME/.claude/bin is first
-# on PATH, ahead of /usr/local/bin and ~/.cargo/bin, in every session. This
-# installer shadows the real command names there — the same house pattern
-# already used for node/pnpm/npm/vitest/tsc (see
-# ~/.claude/bin/_cpu-guard-shim.sh) — rather than editing the neighboring
-# shim family's dispatch script.
+# Never edit Claude Code plugin-cache files: updates may replace them and the
+# cache is not a reliable interception point. If another tool manages the default
+# shim directory, set QUIETLSP_SHIM_DIR to an unmanaged directory that appears
+# before the real language-server binaries on PATH.
 #
-# NEVER hand-edit anything inside ~/.claude/plugins/cache — a plugin update
-# reverts tracked files silently. This installer never touches that tree.
-#
-# DURABILITY (2026-08-15): on this box $HOME/.claude/bin is itself a
-# deploy-managed symlink (Overdeck's packaging/deploy-local.sh convergence
-# overwrites it). A shim this installer writes there directly is transient —
-# it holds until the next deploy, then reverts. The durable copy is the shim
-# source landed in the Overdeck repo (modules/workstation/claude/bin/),
-# deploy-installed alongside it. This installer/its --status remain useful
-# for a local/manual install or for auditing what's currently on disk; they
-# are not the durable mechanism and never write to a location this box
-# doesn't own outright.
-#
-# Idempotent, modeled on ~/.claude/bin/install-headless-guard.
+# The installer is idempotent and refuses to overwrite foreign files.
 set -uo pipefail
 
 MARKER_FAMILY="quietlsp-guard"
@@ -50,8 +26,7 @@ usage: install-quietlsp [--uninstall] [--status]
 
 Wraps the TypeScript and rust-analyzer language servers so Claude Code's LSP
 feature only receives diagnostics for files inside a session's own cwd, via
-a PATH-shadowing shim in ~/.claude/bin (verified first on PATH in every
-sampled session — see README).
+a PATH-shadowing shim in ${QUIETLSP_SHIM_DIR:-$HOME/.claude/bin}.
 
   --status     report wrapped/unwrapped/drifted per target, exit 1 if any
                target is not `wrapped`

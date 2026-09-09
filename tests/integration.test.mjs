@@ -4,9 +4,8 @@
 // proof artifact the spec (R12) requires: "proof is a test, not an
 // attestation".
 //
-// rust-analyzer equivalent: gated on a functional rust-analyzer binary,
-// which this box does not have (only a non-functional `rustup` proxy
-// stub — see README/SPEC.md). That case is named as a gap below, not faked.
+// rust-analyzer equivalent: gated on a functional rust-analyzer binary.
+// The induced-diagnostic case is not implemented yet; that gap is named below, not faked.
 //
 // Run: node tests/integration.test.mjs
 'use strict';
@@ -20,22 +19,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
 const NODE = process.execPath;
-const LOG_PATH = path.join(os.homedir(), '.local/state/overdeck/quietlsp.log');
+const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+const LOG_PATH = process.env.QUIETLSP_LOG || path.join(STATE_HOME, 'quietlsp', 'quietlsp.log');
 
 const TSSERVER = (() => {
   const r = spawnSync('/bin/sh', ['-c', 'command -v typescript-language-server']);
   return r.status === 0 ? r.stdout.toString('utf8').trim() : null;
 })();
+const TSSERVER_JS = process.env.QUIETLSP_TSSERVER_PATH || null;
 const RUST_ANALYZER_FUNCTIONAL = (() => {
   const r = spawnSync('/bin/sh', ['-c', 'command -v rust-analyzer']);
   if (r.status !== 0) return false;
   const bin = r.stdout.toString('utf8').trim();
   const probe = spawnSync(bin, ['--version'], { timeout: 5000 });
-  // Correction 2026-08-16: on this box `command -v rust-analyzer` resolves
-  // to the ~/.cargo/bin rustup proxy, and its --version transparently falls
-  // back to the real /usr/bin/rust-analyzer and succeeds (exit 0) — this
-  // check already detects that correctly. See README "rustup proxy
-  // footgun" — do not assume the proxy itself is non-functional.
+  // Probe behavior instead of assuming that a rustup proxy is functional or non-functional.
   return probe.status === 0 && /^rust-analyzer /.test(probe.stdout?.toString('utf8') ?? '');
 })();
 
@@ -96,6 +93,7 @@ async function driveSession({ command, args, cwd, inTreeFile, siblingFile }) {
       rootUri: uriFor(cwd),
       capabilities: { textDocument: { publishDiagnostics: {}, diagnostic: { dynamicRegistration: true } } },
       workspaceFolders: [{ uri: uriFor(cwd), name: 'in-tree' }],
+      ...(TSSERVER_JS ? { initializationOptions: { tsserver: { path: TSSERVER_JS } } } : {}),
     },
   });
   await new Promise((r) => setTimeout(r, 400));
@@ -128,7 +126,7 @@ async function driveSession({ command, args, cwd, inTreeFile, siblingFile }) {
 }
 
 if (!TSSERVER) {
-  console.log('SKIP - integration: typescript-language-server not installed on this box');
+  console.log('SKIP - integration: typescript-language-server is not installed');
 } else {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-integration-'));
   const inTreeDir = path.join(tmpRoot, 'in-tree');
@@ -175,7 +173,7 @@ if (!TSSERVER) {
     assert.ok(!rewrittenPart.includes('"diagnostic"'), 'rewritten capabilities must have diagnostic stripped');
   });
 
-  test('honest gap: typescript-language-server never advertises diagnosticProvider on this box (5.9.3) — R1 proof is the log, not a negotiated-capability diff', () => {
+  test('typescript-language-server may omit diagnosticProvider — R1 proof is the rewrite log, not a negotiated-capability diff', () => {
     const bareInit = bare.find((m) => m.id === 1 && m.result);
     assert.ok(bareInit, 'bare initialize response missing');
     assert.equal('diagnosticProvider' in bareInit.result.capabilities, false);
@@ -185,9 +183,9 @@ if (!TSSERVER) {
 }
 
 if (!RUST_ANALYZER_FUNCTIONAL) {
-  console.log('GAP - integration: no functional rust-analyzer binary on this box — rust-analyzer push/pull integration case is structural only, not run here');
+  console.log('GAP - integration: no functional rust-analyzer binary detected — rust-analyzer induced-diagnostic case not run');
 } else {
-  console.log('GAP - integration: functional rust-analyzer detected (/usr/bin/rust-analyzer) but the induced-diagnostic driveSession case is not wired for it yet — needs a real Cargo project per fixture dir and untangling rust-analyzer\'s own internal cargo resolution from this box\'s remote-build cargo PATH shim; see SPEC.md R10');
+  console.log('GAP - integration: functional rust-analyzer detected, but the induced-diagnostic driveSession case is not wired yet; it needs a real Cargo project fixture. See SPEC.md R10');
 }
 
 if (process.exitCode) {
