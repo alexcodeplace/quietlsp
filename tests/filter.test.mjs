@@ -246,6 +246,7 @@ test('R7 split: valid frame with unparseable body passes that frame, resumes fil
 });
 
 test('R11: process exits with 128+signal on child death by signal', () => {
+  if (process.platform === 'win32') return; // Windows reports TerminateProcess exit status, not POSIX signal disposition.
   const scriptPath = path.join(os.tmpdir(), `quietlsp-selfkill-server-${process.pid}.mjs`);
   fs.writeFileSync(scriptPath, `
     process.stdin.on('data', () => {});
@@ -288,7 +289,7 @@ test('R4: canonicalizeBestEffort resolves through the deepest existing ancestor'
 test('R4: a symlinked directory is resolved before containment check (out-of-tree via symlink dropped)', () => {
   const realOutside = fs.mkdtempSync(path.join(os.tmpdir(), 'quietlsp-real-outside-'));
   const linkPath = path.join(tmpRoot, 'link-to-outside');
-  fs.symlinkSync(realOutside, linkPath);
+  fs.symlinkSync(realOutside, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
   const f = path.join(linkPath, 'y.ts'); // never created on disk; exercises ancestor-walk canonicalization
   const diag = { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriFor(f), diagnostics: [] } };
   const res = runQuietlsp({ cwd: tmpRoot, messages: [diag] });
@@ -343,7 +344,7 @@ test('R5 end-to-end: a diagnostic for a workspaceFolder outside cwd is forwarded
 });
 
 test('R11: bad real binary path still exits 127, not the close-handler default', () => {
-  const res = spawnSync(process.execPath, [QUIETLSP, '/nonexistent/not-a-real-binary'], { cwd: tmpRoot, input: 'x', encoding: null });
+  const res = spawnSync(process.execPath, [QUIETLSP, path.join(tmpRoot, 'nonexistent', 'not-a-real-binary')], { cwd: tmpRoot, input: 'x', encoding: null });
   assert.equal(res.status, 127);
 });
 
@@ -355,11 +356,11 @@ await new Promise((resolve) => {
   fs.writeFileSync(scriptPath, [
     "let seen = false;",
     "process.stdin.on('data', () => {",
-    "  if (!seen) { seen = true; process.kill(process.pid, 'SIGKILL'); }",
+    process.platform === 'win32' ? "  if (!seen) { seen = true; process.exit(9); }" : "  if (!seen) { seen = true; process.kill(process.pid, 'SIGKILL'); }",
     '});',
   ].join('\n'));
 
-  const child = spawn(QUIETLSP, [process.execPath, scriptPath], { cwd: tmpRoot });
+  const child = spawn(process.execPath, [QUIETLSP, process.execPath, scriptPath], { cwd: tmpRoot });
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
   const iv = setInterval(() => {
@@ -373,7 +374,7 @@ await new Promise((resolve) => {
     });
     resolve();
   });
-  setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 5000);
+  setTimeout(() => { child.kill(process.platform === 'win32' ? undefined : 'SIGKILL'); resolve(); }, 5000);
 });
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });

@@ -19,20 +19,34 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUIETLSP = path.join(__dirname, '..', 'quietlsp');
 const NODE = process.execPath;
-const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+const STATE_HOME = process.env.XDG_STATE_HOME || (process.platform === 'win32'
+  ? (process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'))
+  : path.join(os.homedir(), '.local', 'state'));
 const LOG_PATH = process.env.QUIETLSP_LOG || path.join(STATE_HOME, 'quietlsp', 'quietlsp.log');
 
-const TSSERVER = (() => {
-  const r = spawnSync('/bin/sh', ['-c', 'command -v typescript-language-server']);
-  return r.status === 0 ? r.stdout.toString('utf8').trim() : null;
-})();
+function findCommand(name) {
+  const extensions = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+    : [''];
+  for (const dir of (process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, process.platform === 'win32' ? name + ext.toLowerCase() : name);
+      try {
+        if (fs.statSync(candidate).isFile()) return fs.realpathSync(candidate);
+      } catch {}
+    }
+  }
+  return null;
+}
+
+const TSSERVER_CLI = process.env.QUIETLSP_TYPESCRIPT_LANGUAGE_SERVER_CLI || null;
+const TSSERVER = TSSERVER_CLI ? process.execPath : findCommand('typescript-language-server');
+const TSSERVER_PREFIX_ARGS = TSSERVER_CLI ? [path.resolve(TSSERVER_CLI)] : [];
 const TSSERVER_JS = process.env.QUIETLSP_TSSERVER_PATH || null;
 const RUST_ANALYZER_FUNCTIONAL = (() => {
-  const r = spawnSync('/bin/sh', ['-c', 'command -v rust-analyzer']);
-  if (r.status !== 0) return false;
-  const bin = r.stdout.toString('utf8').trim();
+  const bin = findCommand('rust-analyzer');
+  if (!bin || /\.(cmd|bat)$/i.test(bin)) return false;
   const probe = spawnSync(bin, ['--version'], { timeout: 5000 });
-  // Probe behavior instead of assuming that a rustup proxy is functional or non-functional.
   return probe.status === 0 && /^rust-analyzer /.test(probe.stdout?.toString('utf8') ?? '');
 })();
 
@@ -67,6 +81,16 @@ function parseFrames(buf) {
 }
 
 const uriFor = (p) => pathToFileURL(p).href;
+
+function sameFileUri(left, right) {
+  try {
+    const a = path.resolve(fileURLToPath(left));
+    const b = path.resolve(fileURLToPath(right));
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    return left === right;
+  }
+}
 
 function test(name, fn) {
   try {
@@ -112,7 +136,7 @@ async function driveSession({ command, args, cwd, inTreeFile, siblingFile }) {
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
     const msgs = parseFrames(out);
-    const sawInTree = msgs.some((m) => m.method === 'textDocument/publishDiagnostics' && m.params?.uri === uriFor(inTreeFile));
+    const sawInTree = msgs.some((m) => m.method === 'textDocument/publishDiagnostics' && sameFileUri(m.params?.uri, uriFor(inTreeFile)));
     if (sawInTree) {
       await new Promise((r) => setTimeout(r, 500)); // let any sibling diagnostic land too
       break;
@@ -141,20 +165,20 @@ if (!TSSERVER) {
   const logSizeBefore = fs.existsSync(LOG_PATH) ? fs.statSync(LOG_PATH).size : 0;
 
   const [wrapped, bare] = await Promise.all([
-    driveSession({ command: NODE, args: [QUIETLSP, TSSERVER, '--stdio'], cwd: inTreeDir, inTreeFile, siblingFile }),
-    driveSession({ command: TSSERVER, args: ['--stdio'], cwd: inTreeDir, inTreeFile, siblingFile }),
+    driveSession({ command: NODE, args: [QUIETLSP, TSSERVER, ...TSSERVER_PREFIX_ARGS, '--stdio'], cwd: inTreeDir, inTreeFile, siblingFile }),
+    driveSession({ command: TSSERVER, args: [...TSSERVER_PREFIX_ARGS, '--stdio'], cwd: inTreeDir, inTreeFile, siblingFile }),
   ]);
 
   test('bare server (ground truth): both in-tree and sibling diagnostics arrive', () => {
     const diagUris = bare.filter((m) => m.method === 'textDocument/publishDiagnostics').map((m) => m.params.uri);
-    assert.ok(diagUris.includes(uriFor(inTreeFile)), 'in-tree diagnostic missing from ground truth run');
-    assert.ok(diagUris.includes(uriFor(siblingFile)), 'sibling diagnostic missing from ground truth run — test fixture is not exercising real diagnostics');
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(inTreeFile))), `in-tree diagnostic missing from ground truth run; got ${JSON.stringify(diagUris)}`);
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(siblingFile))), `sibling diagnostic missing from ground truth run — got ${JSON.stringify(diagUris)}`);
   });
 
   test('wrapped: in-tree diagnostic is delivered, sibling diagnostic is dropped', () => {
     const diagUris = wrapped.filter((m) => m.method === 'textDocument/publishDiagnostics').map((m) => m.params.uri);
-    assert.ok(diagUris.includes(uriFor(inTreeFile)), 'in-tree diagnostic missing through the wrapper');
-    assert.ok(!diagUris.includes(uriFor(siblingFile)), 'sibling diagnostic leaked through the wrapper');
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(inTreeFile))), `in-tree diagnostic missing through the wrapper; got ${JSON.stringify(diagUris)}`);
+    assert.ok(!diagUris.some((uri) => sameFileUri(uri, uriFor(siblingFile))), `sibling diagnostic leaked through the wrapper; got ${JSON.stringify(diagUris)}`);
   });
 
   test('unrelated traffic (initialize response) is byte-identical wrapped vs bare', () => {

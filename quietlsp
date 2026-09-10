@@ -23,7 +23,9 @@ const path = require('node:path');
 const os = require('node:os');
 const { fileURLToPath } = require('node:url');
 
-const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+const STATE_HOME = process.env.XDG_STATE_HOME || (process.platform === 'win32'
+  ? (process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'))
+  : path.join(os.homedir(), '.local', 'state'));
 const LOG_PATH = process.env.QUIETLSP_LOG || path.join(STATE_HOME, 'quietlsp', 'quietlsp.log');
 
 function logOnce(msg) {
@@ -79,7 +81,8 @@ function makeOrderedWriter(stream) {
 // code; death by signal N reports 128+N.
 function exitCodeFor(code, signal) {
   if (signal) {
-    const n = os.constants.signals[signal];
+    const fallbackSignals = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
+    const n = os.constants.signals[signal] || fallbackSignals[signal];
     return n ? 128 + n : 1;
   }
   return code ?? 0;
@@ -156,7 +159,8 @@ function main() {
   const forward = (sig) => {
     try { child.kill(sig); } catch { /* already gone */ }
   };
-  ['SIGINT', 'SIGTERM', 'SIGHUP'].forEach((sig) => process.on(sig, () => forward(sig)));
+  const forwardedSignals = process.platform === 'win32' ? ['SIGINT', 'SIGTERM'] : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  forwardedSignals.forEach((sig) => process.on(sig, () => forward(sig)));
 
   // 'close', not 'exit': 'exit' fires as soon as the child process terminates,
   // but buffered stdout data can still be delivered as 'data' events after
