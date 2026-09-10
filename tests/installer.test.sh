@@ -4,6 +4,7 @@
 # touches ~/.claude/bin or /usr/local/bin.
 set -uo pipefail
 REPO="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+NODE_BIN="$(command -v node)"
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf -- "$SANDBOX"' EXIT
 
@@ -23,6 +24,7 @@ chmod 755 "$REALDIR/typescript-language-server"
 # binary found" branch without a fatal exit.
 
 export QUIETLSP_SHIM_DIR="$SHIM_DIR"
+export QUIETLSP_NODE="$NODE_BIN"
 export PATH="$REALDIR:/usr/bin:/bin"
 INSTALLER="$REPO/install-quietlsp"
 run() { "$INSTALLER" "$@"; }

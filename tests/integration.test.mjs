@@ -82,6 +82,16 @@ function parseFrames(buf) {
 
 const uriFor = (p) => pathToFileURL(p).href;
 
+function sameFileUri(left, right) {
+  try {
+    const a = path.resolve(fileURLToPath(left));
+    const b = path.resolve(fileURLToPath(right));
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    return left === right;
+  }
+}
+
 function test(name, fn) {
   try {
     fn();
@@ -126,7 +136,7 @@ async function driveSession({ command, args, cwd, inTreeFile, siblingFile }) {
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
     const msgs = parseFrames(out);
-    const sawInTree = msgs.some((m) => m.method === 'textDocument/publishDiagnostics' && m.params?.uri === uriFor(inTreeFile));
+    const sawInTree = msgs.some((m) => m.method === 'textDocument/publishDiagnostics' && sameFileUri(m.params?.uri, uriFor(inTreeFile)));
     if (sawInTree) {
       await new Promise((r) => setTimeout(r, 500)); // let any sibling diagnostic land too
       break;
@@ -161,14 +171,14 @@ if (!TSSERVER) {
 
   test('bare server (ground truth): both in-tree and sibling diagnostics arrive', () => {
     const diagUris = bare.filter((m) => m.method === 'textDocument/publishDiagnostics').map((m) => m.params.uri);
-    assert.ok(diagUris.includes(uriFor(inTreeFile)), 'in-tree diagnostic missing from ground truth run');
-    assert.ok(diagUris.includes(uriFor(siblingFile)), 'sibling diagnostic missing from ground truth run — test fixture is not exercising real diagnostics');
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(inTreeFile))), `in-tree diagnostic missing from ground truth run; got ${JSON.stringify(diagUris)}`);
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(siblingFile))), `sibling diagnostic missing from ground truth run — got ${JSON.stringify(diagUris)}`);
   });
 
   test('wrapped: in-tree diagnostic is delivered, sibling diagnostic is dropped', () => {
     const diagUris = wrapped.filter((m) => m.method === 'textDocument/publishDiagnostics').map((m) => m.params.uri);
-    assert.ok(diagUris.includes(uriFor(inTreeFile)), 'in-tree diagnostic missing through the wrapper');
-    assert.ok(!diagUris.includes(uriFor(siblingFile)), 'sibling diagnostic leaked through the wrapper');
+    assert.ok(diagUris.some((uri) => sameFileUri(uri, uriFor(inTreeFile))), `in-tree diagnostic missing through the wrapper; got ${JSON.stringify(diagUris)}`);
+    assert.ok(!diagUris.some((uri) => sameFileUri(uri, uriFor(siblingFile))), `sibling diagnostic leaked through the wrapper; got ${JSON.stringify(diagUris)}`);
   });
 
   test('unrelated traffic (initialize response) is byte-identical wrapped vs bare', () => {
