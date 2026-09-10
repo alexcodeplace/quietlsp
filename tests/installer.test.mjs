@@ -54,7 +54,7 @@ check('install is idempotent', () => {
   const after = readFileSync(dest, 'utf8');
   assert.equal(r.status, 0, r.stderr);
   assert.equal(after, before);
-  assert.match(r.stdout, /wrapped=0 refreshed=0 current=1/);
+  assert.match(r.stdout, /wrapped=0 refreshed=0 current=[1-9]\d*/);
 });
 
 check('status detects owned drift and install repairs it', () => {

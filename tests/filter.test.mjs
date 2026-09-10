@@ -360,7 +360,7 @@ await new Promise((resolve) => {
     '});',
   ].join('\n'));
 
-  const child = spawn(QUIETLSP, [process.execPath, scriptPath], { cwd: tmpRoot });
+  const child = spawn(process.execPath, [QUIETLSP, process.execPath, scriptPath], { cwd: tmpRoot });
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
   const iv = setInterval(() => {
