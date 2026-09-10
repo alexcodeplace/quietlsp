@@ -15,7 +15,7 @@ Claude Code language-server diagnostics can cross session/worktree boundaries wh
 
 ## Attach contract
 
-Current supported seam: Claude Code resolves the language-server command through PATH. The installer shadows `typescript-language-server` / `rust-analyzer` in `QUIETLSP_SHIM_DIR` (default `$HOME/.claude/bin`) and resolves the real executable later on PATH.
+Current supported seam: Claude Code resolves the language-server command through PATH. The installer shadows `typescript-language-server` / `rust-analyzer` in `QUIETLSP_SHIM_DIR` (default `$HOME/.claude/bin` on Unix and `%USERPROFILE%\.claude\bin` on Windows) and resolves the real executable later on PATH. Windows uses owned `.cmd` shims and requires neither Bash nor WSL.
 
 A runtime that bypasses PATH requires a separately qualified attach mechanism; never silently claim interception when the launch seam changed.
 
@@ -60,7 +60,8 @@ If a future client/server combination requires pull mode, filtering pull respons
 Default:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/quietlsp/quietlsp.log
+Unix: `${XDG_STATE_HOME:-~/.local/state}/quietlsp/quietlsp.log`
+Windows: `%LOCALAPPDATA%\quietlsp\quietlsp.log`
 ```
 
 `QUIETLSP_LOG` overrides the destination. Logging failure must never break the language-server stream.

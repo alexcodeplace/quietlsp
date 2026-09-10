@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }})
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install real language-server fixtures
+        shell: bash
+        run: npm install --no-save --package-lock=false typescript-language-server@6.0.0 typescript@5.9.3
+      - name: Framing and filtering contract
+        run: node tests/filter.test.mjs
+      - name: Cross-platform installer contract
+        run: node tests/installer.test.mjs
+      - name: Bash compatibility installer contract
+        if: runner.os == 'Linux'
+        run: bash tests/installer.test.sh
+      - name: Real TypeScript language-server integration
+        shell: bash
+        env:
+          QUIETLSP_TYPESCRIPT_LANGUAGE_SERVER_CLI: ${{ github.workspace }}/node_modules/typescript-language-server/lib/cli.mjs
+          QUIETLSP_TSSERVER_PATH: ${{ github.workspace }}/node_modules/typescript/lib/tsserver.js
+          QUIETLSP_LOG: ${{ runner.temp }}/quietlsp-integration.log
+        run: node tests/integration.test.mjs

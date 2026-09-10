@@ -23,7 +23,7 @@ QuietLSP does not modify project source files or server-side conversation data.
 
 Claude Code's language-server plugins currently resolve `typescript-language-server` and `rust-analyzer` by command name. QuietLSP therefore uses a PATH-shadowing shim rather than modifying plugin-cache files.
 
-The default shim directory is `$HOME/.claude/bin`; override it with `QUIETLSP_SHIM_DIR` if your environment uses another directory that is earlier on PATH than the real language-server binary.
+The default shim directory is `$HOME/.claude/bin` on Unix and `%USERPROFILE%\.claude\bin` on Windows. Override it with `QUIETLSP_SHIM_DIR` if your environment uses another directory that is earlier on PATH than the real language-server binary.
 
 Do not install by editing `~/.claude/plugins/cache/**`: cache contents can be replaced by plugin updates and are not a reliable attachment point.
 
@@ -45,13 +45,7 @@ Server -> client traffic is parsed as Content-Length-framed JSON-RPC:
 - malformed framing permanently fails open to raw passthrough rather than risking a broken LSP stream;
 - a single valid frame containing unparseable JSON passes unchanged and filtering resumes afterward.
 
-Diagnostic/capability events are logged to:
-
-```text
-${XDG_STATE_HOME:-~/.local/state}/quietlsp/quietlsp.log
-```
-
-Set `QUIETLSP_LOG` to override the log file.
+Diagnostic/capability events are logged beneath `${XDG_STATE_HOME:-~/.local/state}/quietlsp/` on Unix and `%LOCALAPPDATA%\quietlsp\` on Windows. Set `QUIETLSP_LOG` to override the exact log file.
 
 ## Install
 
@@ -61,10 +55,21 @@ Requirements:
 - Claude Code language-server feature;
 - `typescript-language-server` and/or `rust-analyzer` installed on PATH.
 
+Unix compatibility entrypoint:
+
 ```sh
 ./install-quietlsp
 ./install-quietlsp --status
 ```
+
+Cross-platform canonical installer (including native Windows):
+
+```text
+node install-quietlsp.mjs
+node install-quietlsp.mjs --status
+```
+
+On Windows the installer writes `.cmd` PATH shims; it does not require Bash or WSL.
 
 The installer:
 
@@ -91,9 +96,12 @@ The repository currently has fixture and installer coverage plus a live TypeScri
 
 ```sh
 node tests/filter.test.mjs
-bash tests/installer.test.sh
+node tests/installer.test.mjs
+bash tests/installer.test.sh   # Unix compatibility wrapper
 node tests/integration.test.mjs
 ```
+
+GitHub CI runs the framing/filtering, cross-platform installer, and a real `typescript-language-server` integration on both Ubuntu and native Windows.
 
 The integration test skips honestly when `typescript-language-server` is not installed. If the language server cannot discover a TypeScript installation from the fixture workspace, set `QUIETLSP_TSSERVER_PATH=/absolute/path/to/typescript/lib/tsserver.js`. It never turns a missing dependency into a fake pass claim.
 
