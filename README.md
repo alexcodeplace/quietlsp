@@ -19,6 +19,57 @@ real typescript-language-server / rust-analyzer
 
 QuietLSP does not modify project source files or server-side conversation data.
 
+## First setup and everyday use
+
+QuietLSP is useful when an agent working on your checkout is distracted by diagnostics from another project or worktree. It is not a code fixer: it narrows which **local-file diagnostics** reach that session while keeping in-scope errors visible.
+
+Install the real language server first. For a TypeScript project, this normally means having both TypeScript and `typescript-language-server` available to the environment that launches Claude Code; for Rust, verify that `rust-analyzer --version` succeeds. Use Node.js 22 or newer for the same runtime generation exercised by this repository's CI.
+
+```sh
+git clone https://github.com/alexcodeplace/quietlsp.git
+cd quietlsp
+node install-quietlsp.mjs
+node install-quietlsp.mjs --status
+```
+
+The Node installer also works in native Windows without Bash/WSL. Keep the clone at a stable path: the installed shims reference its `quietlsp` program and the resolved real server. Put the shim directory before the real server on the PATH inherited by **new** Claude Code sessions; the installer creates shims but does not rewrite your shell startup files or restart running sessions.
+
+On Unix, check `command -v typescript-language-server`; on Windows use `where.exe typescript-language-server`. The first match should be the QuietLSP shim. `--status` identifies the owned shims; also verify the real server's version and launch a new Claude Code session from your project's own directory.
+
+### Examples
+
+- **Two worktrees:** open one new agent session from each worktree root. A diagnostic in worktree B should not appear in session A unless B is deliberately included in A's validated workspace roots.
+- **A large TypeScript repository:** keep type errors in the active workspace visible while discarding unrelated local-file diagnostics. QuietLSP does not suppress all TypeScript warnings or change their severity.
+- **A mixed workspace:** explicitly included workspace folders remain in scope. Do not mistake their retained errors for a broken filter; inspect the root configuration first.
+
+There is no separate daily command after attachment: continue editing through Claude Code and let the shim proxy the language server. Diagnostic/capability logs use the platform-specific location below. For a controlled check, introduce an obvious type error in a disposable TypeScript fixture, confirm it remains visible in scope, and remove it afterward.
+
+### Undo only QuietLSP
+
+```sh
+node install-quietlsp.mjs --uninstall
+node install-quietlsp.mjs --status
+```
+
+The uninstaller removes only owned shims. Restore any PATH entry you added yourself, then use a new client session. Do not edit plugin caches or delete the real language server.
+
+### Ask an agent to install and attach it
+
+```text
+Set up QuietLSP for my Claude Code projects using
+https://github.com/alexcodeplace/quietlsp and its current README.
+Inspect the OS, Node, client environment, existing PATH shims and real language
+servers first. Clone to a stable location and use node install-quietlsp.mjs.
+Preserve foreign shims and plugin caches. Ask before changing persistent PATH
+or installing a missing language server. Verify --status and that a new
+Claude Code process resolves the shim before the real server. Do not close or
+restart my active sessions. Use a disposable TypeScript fixture to prove that
+in-scope errors remain visible and unrelated local-file diagnostics are filtered;
+report any interactive-client check that still needs me. Do not claim equivalent
+Rust integration coverage. Show the final paths, daily workflow and owned-shim
+uninstall command. Leave my project source and unrelated settings unchanged.
+```
+
 ## Attach mechanism
 
 Claude Code's language-server plugins currently resolve `typescript-language-server` and `rust-analyzer` by command name. QuietLSP therefore uses a PATH-shadowing shim rather than modifying plugin-cache files.
